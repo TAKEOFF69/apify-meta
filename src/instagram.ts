@@ -1,4 +1,5 @@
 import { Actor, log } from 'apify'
+import { gotScraping } from 'got-scraping'
 import type { CompetitorSocialResult, SocialPost } from './types.js'
 
 type ProfileResult = Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'platform' | 'scraped_at'>
@@ -6,13 +7,12 @@ type ProfileResult = Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'pl
 /**
  * Scrape an Instagram public profile — focused on POST ENGAGEMENT data.
  *
- * Strategy cascade (each gives progressively less data):
+ * Strategy cascade:
  * 1. Private REST API — full data: profile + posts with likes/comments/dates
- * 2. Profile HTML JSON extraction — posts with engagement from embedded <script> data
- * 3. Meta tag fallback — profile metrics only (followers, posts count), no post engagement
+ * 2. Web page via got-scraping (browser TLS fingerprint) — embedded JSON + meta tags
  *
- * The primary goal is recent_posts[] with per-post engagement (likes, comments).
- * Profile metrics (followers) are secondary.
+ * got-scraping mimics browser TLS fingerprint so Meta serves SSR content
+ * instead of a JS-only shell (which regular fetch gets).
  */
 export async function scrapeInstagram(
   handle: string,
@@ -34,25 +34,21 @@ export async function scrapeInstagram(
     if (retryResult && !retryResult.error && retryResult.recent_posts.length > 0) return retryResult
   }
 
-  // Strategy 2: Web page HTML — extract posts from embedded JSON + meta tags
-  log.info(`    IG API: ${apiResult?.error ?? 'no posts'}, trying web page extraction`)
+  // Strategy 2: Web page via got-scraping — browser TLS fingerprint gets SSR content
+  log.info(`    IG API: ${apiResult?.error ?? 'no posts'}, trying web page (got-scraping)`)
   const webResult = await tryWebPage(cleanHandle, postsLimit, proxyUrl)
 
-  // Prefer web result if it has posts (even if API returned some profile data)
   if (webResult && webResult.recent_posts.length > 0) return webResult
 
-  // If web result has profile data but no posts, merge with any API data
   if (webResult && webResult.followers !== null) {
-    // Web has profile metrics, API might have had partial data
     return {
       ...webResult,
       error: webResult.recent_posts.length === 0
-        ? 'Profile metrics OK but no post engagement data (IG blocks API + no embedded JSON)'
+        ? 'Profile metrics OK but no post engagement data'
         : null,
     }
   }
 
-  // Return whatever we got
   return apiResult ?? webResult ?? {
     followers: null, following: null, posts_count: null, bio: null,
     recent_posts: [], error: 'All strategies failed',
@@ -69,30 +65,23 @@ async function tryPrivateApi(
   proxyUrl: string | null,
 ): Promise<ProfileResult | null> {
   try {
-    // Visit the PROFILE page (not homepage) to get relevant session cookies
+    // Visit the profile page first to get session cookies (via got-scraping for better TLS)
     const sessionCookies = await getSessionCookies(
       `https://www.instagram.com/${handle}/`,
       proxyUrl,
     )
 
-    // Small delay — immediate API call after cookie fetch looks bot-like
     await sleep(randomBetween(1500, 3000))
 
     const url = `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(handle)}`
 
-    const ua = randomUserAgent()
     const headers: Record<string, string> = {
       'x-ig-app-id': '936619743392459',
-      'User-Agent': ua,
       'Accept': '*/*',
       'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
       'Origin': 'https://www.instagram.com',
       'Referer': `https://www.instagram.com/${handle}/`,
       'X-Requested-With': 'XMLHttpRequest',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-site',
     }
 
     if (sessionCookies) {
@@ -101,13 +90,24 @@ async function tryPrivateApi(
       if (csrfMatch) headers['X-CSRFToken'] = csrfMatch[1]
     }
 
-    const response = await fetchWithProxy(url, { headers, signal: AbortSignal.timeout(30_000) }, proxyUrl)
+    // Use got-scraping for the API call too — browser TLS fingerprint helps
+    const response = await gotScraping({
+      url,
+      headers,
+      proxyUrl: proxyUrl ?? undefined,
+      timeout: { request: 30_000 },
+      headerGeneratorOptions: {
+        browsers: [{ name: 'chrome', minVersion: 120 }],
+        operatingSystems: ['windows'],
+        locales: ['en-US'],
+      },
+    })
 
-    if (!response.ok) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${response.status}` }
+    if (response.statusCode !== 200) {
+      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${response.statusCode}` }
     }
 
-    const data = await response.json() as InstagramApiResponse
+    const data = JSON.parse(response.body) as InstagramApiResponse
     const user = data?.data?.user
 
     if (!user) {
@@ -147,7 +147,7 @@ async function tryPrivateApi(
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 2: Web page — extract embedded JSON posts + meta tag profile data
+// Strategy 2: Web page via got-scraping (browser TLS fingerprint)
 // ---------------------------------------------------------------------------
 
 async function tryWebPage(
@@ -158,38 +158,24 @@ async function tryWebPage(
   try {
     const url = `https://www.instagram.com/${handle}/`
 
-    // Get cookies first — Instagram serves SSR content more reliably with session cookies
-    const cookies = await getSessionCookies('https://www.instagram.com/', proxyUrl)
+    const response = await gotScraping({
+      url,
+      proxyUrl: proxyUrl ?? undefined,
+      timeout: { request: 30_000 },
+      followRedirect: true,
+      headerGeneratorOptions: {
+        browsers: [{ name: 'chrome', minVersion: 120 }],
+        operatingSystems: ['windows'],
+        locales: ['en-US'],
+      },
+    })
 
-    const headers: Record<string, string> = {
-      'User-Agent': randomUserAgent(),
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Upgrade-Insecure-Requests': '1',
-      'Cache-Control': 'max-age=0',
+    if (response.statusCode !== 200) {
+      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `Web HTTP ${response.statusCode}` }
     }
 
-    if (cookies) {
-      headers['Cookie'] = cookies
-    }
-
-    const response = await fetchWithProxy(url, {
-      headers,
-      signal: AbortSignal.timeout(30_000),
-      redirect: 'follow',
-    }, proxyUrl)
-
-    if (!response.ok) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `Web HTTP ${response.status}` }
-    }
-
-    const html = await response.text()
-    log.info(`    IG web: ${response.status}, HTML ${html.length} chars`)
+    const html = response.body
+    log.info(`    IG web: ${response.statusCode}, HTML ${html.length} chars`)
 
     // Debug: check what kind of page we got
     const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
@@ -200,16 +186,12 @@ async function tryWebPage(
     const isLoginPage = html.includes('/accounts/login') || html.includes('loginForm')
     log.info(`    IG web: title="${title}" meta=${hasMetaTags} shortcodes=${hasShortcodes} edgeMedia=${hasEdgeMedia} login=${isLoginPage}`)
 
-    // --- Extract posts from embedded JSON in HTML ---
     const posts = extractPostsFromHtml(html, postsLimit)
     if (posts.length > 0) {
-      log.info(`    IG HTML: extracted ${posts.length} posts with engagement from embedded JSON`)
+      log.info(`    IG HTML: extracted ${posts.length} posts with engagement`)
     }
 
-    // --- Extract profile metrics from meta tags ---
     const profile = extractProfileFromMetaTags(html)
-
-    // If we found posts in JSON, also try to get profile data from JSON
     const jsonProfile = extractProfileFromJson(html)
 
     return {
@@ -234,8 +216,6 @@ function extractPostsFromHtml(html: string, limit: number): SocialPost[] {
   const posts: SocialPost[] = []
   const seen = new Set<string>()
 
-  // Instagram embeds post data in <script> tags as JSON.
-  // Look for "shortcode" occurrences and extract nearby engagement data.
   const shortcodePattern = /"shortcode"\s*:\s*"([A-Za-z0-9_-]+)"/g
   let match: RegExpExecArray | null
 
@@ -245,19 +225,15 @@ function extractPostsFromHtml(html: string, limit: number): SocialPost[] {
     seen.add(shortcode)
 
     const pos = match.index
-    // Look in a window around the shortcode for related data
     const start = Math.max(0, pos - 500)
     const end = Math.min(html.length, pos + 3000)
     const vicinity = html.slice(start, end)
 
-    // Extract engagement metrics from the vicinity
     const likes = vicinity.match(/"edge_liked_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/)
       ?? vicinity.match(/"edge_media_preview_like"\s*:\s*\{\s*"count"\s*:\s*(\d+)/)
     const comments = vicinity.match(/"edge_media_to_comment"\s*:\s*\{\s*"count"\s*:\s*(\d+)/)
     const timestamp = vicinity.match(/"taken_at_timestamp"\s*:\s*(\d+)/)
     const isVideo = vicinity.match(/"is_video"\s*:\s*(true|false)/)
-
-    // Caption: may be in nested edges structure
     const captionText = vicinity.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1]
 
     posts.push({
@@ -276,7 +252,7 @@ function extractPostsFromHtml(html: string, limit: number): SocialPost[] {
 }
 
 // ---------------------------------------------------------------------------
-// Extract profile metrics from meta tags (og:description)
+// Extract profile from meta tags / embedded JSON
 // ---------------------------------------------------------------------------
 
 function extractProfileFromMetaTags(html: string): {
@@ -289,7 +265,6 @@ function extractProfileFromMetaTags(html: string): {
   if (!desc) return { followers: null, following: null, postsCount: null, bio: null }
 
   const decoded = decodeHtmlEntities(desc)
-
   const followersMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Followers|obserwuj[aą]cych|follower)/i)
   const followingMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Following|obserwowanych)/i)
   const postsMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Posts|post[oó]w|post)\b/i)
@@ -302,10 +277,6 @@ function extractProfileFromMetaTags(html: string): {
     bio: bioMatch ? bioMatch[1].trim().slice(0, 300) : null,
   }
 }
-
-// ---------------------------------------------------------------------------
-// Extract profile metrics from embedded JSON (more accurate than meta tags)
-// ---------------------------------------------------------------------------
 
 function extractProfileFromJson(html: string): {
   followers: number | null; following: number | null; postsCount: number | null; bio: string | null
@@ -324,28 +295,29 @@ function extractProfileFromJson(html: string): {
 }
 
 // ---------------------------------------------------------------------------
-// Get session cookies by visiting a page
+// Session cookies via got-scraping
 // ---------------------------------------------------------------------------
 
 async function getSessionCookies(pageUrl: string, proxyUrl: string | null): Promise<string | null> {
   try {
-    const response = await fetchWithProxy(pageUrl, {
-      headers: {
-        'User-Agent': randomUserAgent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
+    const response = await gotScraping({
+      url: pageUrl,
+      proxyUrl: proxyUrl ?? undefined,
+      timeout: { request: 15_000 },
+      followRedirect: true,
+      headerGeneratorOptions: {
+        browsers: [{ name: 'chrome', minVersion: 120 }],
+        operatingSystems: ['windows'],
+        locales: ['en-US'],
       },
-      signal: AbortSignal.timeout(15_000),
-      redirect: 'follow',
-    }, proxyUrl)
+    })
 
-    const setCookies = response.headers.getSetCookie?.() ?? []
-    if (setCookies.length === 0) return null
+    // got-scraping returns headers as lowercased keys
+    const setCookieHeaders = response.headers['set-cookie']
+    if (!setCookieHeaders) return null
 
-    const cookies = setCookies
-      .map(c => c.split(';')[0])
-      .join('; ')
-
+    const cookieArray = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders]
+    const cookies = cookieArray.map(c => c.split(';')[0]).join('; ')
     return cookies || null
   } catch (err) {
     log.warning(`Failed to get session cookies: ${err}`)
@@ -354,7 +326,7 @@ async function getSessionCookies(pageUrl: string, proxyUrl: string | null): Prom
 }
 
 // ---------------------------------------------------------------------------
-// Get a fresh proxy URL with new session ID (= new IP)
+// Fresh proxy URL for retry
 // ---------------------------------------------------------------------------
 
 async function getFreshProxyUrl(currentProxyUrl: string): Promise<string | null> {
@@ -367,24 +339,7 @@ async function getFreshProxyUrl(currentProxyUrl: string): Promise<string | null>
 }
 
 // ---------------------------------------------------------------------------
-// Fetch helper with optional proxy
-// ---------------------------------------------------------------------------
-
-async function fetchWithProxy(
-  url: string,
-  init: RequestInit,
-  proxyUrl: string | null,
-): Promise<Response> {
-  if (proxyUrl) {
-    const { ProxyAgent } = await import('undici')
-    const agent = new ProxyAgent(proxyUrl)
-    return fetch(url, { ...init, dispatcher: agent } as RequestInit)
-  }
-  return fetch(url, init)
-}
-
-// ---------------------------------------------------------------------------
-// Instagram API response types
+// Types
 // ---------------------------------------------------------------------------
 
 interface InstagramApiResponse {
@@ -428,7 +383,6 @@ function decodeHtmlEntities(text: string): string {
     .replace(/[\u00A0\u2009\u202F]/g, ' ')
 }
 
-/** Decode JSON string escapes like \n, \u00f3, \/ */
 function decodeJsonEscapes(text: string): string {
   return text
     .replace(/\\n/g, ' ')
@@ -448,7 +402,6 @@ function parseCount(text: string): number | null {
   if (!multiplierMatch) return null
 
   let numStr = multiplierMatch[1]
-
   if (/,\d{3}/.test(numStr)) {
     numStr = numStr.replace(/,/g, '')
   } else if (/\.\d{3}/.test(numStr)) {
@@ -473,16 +426,4 @@ function sleep(ms: number): Promise<void> {
 
 function randomBetween(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min
-}
-
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15',
-]
-
-function randomUserAgent(): string {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]
 }
