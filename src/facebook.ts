@@ -85,10 +85,10 @@ function extractFollowers(html: string): number | null {
   const ogMatch = html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i)
     ?? html.match(/<meta\s+content="([^"]+)"\s+property="og:description"/i)
   if (ogMatch) {
-    const desc = ogMatch[1]
+    const desc = decodeHtmlEntities(ogMatch[1])
 
-    // Polish: "1 234 osób lubi to" or "1 234 obserwujących"
-    const plMatch = desc.match(/([\d\s,.]+)\s*(?:osób lubi|obserwujących|polubień)/i)
+    // Polish: "92 525 osób lubi to" or "1 234 obserwujących"
+    const plMatch = desc.match(/([\d\s,.]+)\s*(?:os[oó]b lubi|obserwuj[aą]cych|polubie[nń])/i)
     if (plMatch) return parseCount(plMatch[1])
 
     // English: "1,234 people like this" or "1,234 followers"
@@ -99,8 +99,8 @@ function extractFollowers(html: string): number | null {
   // Strategy 2: Look for follower count in page meta
   const metaDesc = html.match(/<meta\s+name="description"\s+content="([^"]+)"/i)
   if (metaDesc) {
-    const desc = metaDesc[1]
-    const plMatch = desc.match(/([\d\s,.]+)\s*(?:osób lubi|obserwujących|polubień)/i)
+    const desc = decodeHtmlEntities(metaDesc[1])
+    const plMatch = desc.match(/([\d\s,.]+)\s*(?:os[oó]b lubi|obserwuj[aą]cych|polubie[nń])/i)
     if (plMatch) return parseCount(plMatch[1])
     const enMatch = desc.match(/([\d\s,.]+)\s*(?:people like|followers|likes)/i)
     if (enMatch) return parseCount(enMatch[1])
@@ -124,16 +124,16 @@ function extractBio(html: string): string | null {
   const ogMatch = html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i)
     ?? html.match(/<meta\s+content="([^"]+)"\s+property="og:description"/i)
   if (ogMatch) {
-    const desc = ogMatch[1]
-    // Bio is typically after the stats portion, separated by dash or period
-    const bioMatch = desc.match(/[-–—.]\s*(.{10,})$/)
+    const desc = decodeHtmlEntities(ogMatch[1])
+    // Bio is typically after the stats portion, separated by dash, dot, or middle dot
+    const bioMatch = desc.match(/[-–—·.]\s*(.{10,})$/)
     if (bioMatch) return bioMatch[1].trim().slice(0, 300)
   }
 
   // Try page title for basic info
   const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i)
   if (titleMatch) {
-    const title = titleMatch[1].replace(/\s*[-|]\s*Facebook.*$/i, '').trim()
+    const title = decodeHtmlEntities(titleMatch[1]).replace(/\s*[-|]\s*Facebook.*$/i, '').trim()
     if (title.length > 5) return title.slice(0, 300)
   }
 
@@ -153,10 +153,13 @@ function extractPostsFromHtml(html: string, limit: number): SocialPost[] {
   let count = 0
 
   while ((match = postPattern.exec(html)) !== null && count < limit) {
-    const text = match[1]
-      .replace(/\\n/g, ' ')
-      .replace(/\\u[\da-fA-F]{4}/g, '')
-      .trim()
+    const text = decodeHtmlEntities(
+      match[1]
+        .replace(/\\n/g, ' ')
+        .replace(/\\u[\da-fA-F]{4}/g, (m) => {
+          try { return String.fromCodePoint(parseInt(m.slice(2), 16)) } catch { return '' }
+        })
+    ).trim()
 
     if (text.length < 10) continue
 
@@ -185,6 +188,18 @@ function extractPostsFromHtml(html: string, limit: number): SocialPost[] {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+}
 
 function parseCount(text: string): number | null {
   const cleaned = text.trim().replace(/\s/g, '')
