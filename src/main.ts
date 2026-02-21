@@ -91,13 +91,16 @@ try {
 }
 
 // --- Optimization #2: Reuse browser contexts (one launch, multiple pages) ---
+// Non-headless mode on XVFB = real Chrome to fingerprinting checks.
+// Apify's container already runs xvfb-run, so this works without a display.
 const browser = await chromium.launch({
-  headless: true,
+  headless: false,
   args: [
-    '--disable-gpu',
     '--no-sandbox',
     '--disable-dev-shm-usage',
     '--disable-blink-features=AutomationControlled',
+    '--disable-infobars',
+    '--window-size=1280,720',
   ],
 })
 
@@ -119,6 +122,26 @@ async function createContext(proxyUrl: string | null): Promise<BrowserContext> {
     }
   }
   const ctx = await browser.newContext(contextOptions)
+
+  // Anti-detection: override common headless browser signals
+  await ctx.addInitScript(() => {
+    // Hide webdriver flag
+    Object.defineProperty(navigator, 'webdriver', { get: () => false })
+
+    // Fake plugins array (headless has none)
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [1, 2, 3, 4, 5] as any,
+    })
+
+    // Fake languages
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en', 'pl'],
+    })
+
+    // Override chrome automation markers
+    const w = window as any
+    w.chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}) }
+  })
 
   // Optimization #1: Block unnecessary resources
   await ctx.route('**/*', (route) => {
