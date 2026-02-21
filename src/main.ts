@@ -53,28 +53,52 @@ let igProxyUrl: string | null = null
 let fbProxyUrl: string | null = null
 
 try {
-  const residentialProxy = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] })
-  igProxyUrl = (await residentialProxy?.newUrl(`ig_session_${Date.now()}`)) ?? null
-  log.info(`IG proxy (residential): ${igProxyUrl ? igProxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
+  // Polish residential IP — IG geo-restricts profiles viewed from outside the region
+  const residentialProxy = await Actor.createProxyConfiguration({
+    groups: ['RESIDENTIAL'],
+    countryCode: 'PL',
+  })
+  igProxyUrl = (await residentialProxy?.newUrl(`ig_${Date.now()}`)) ?? null
+  log.info(`IG proxy (residential PL): ${igProxyUrl ? igProxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
 } catch (err) {
   log.warning(`Residential proxy not available: ${err}`)
+  try {
+    // Fallback: residential without country targeting
+    const fallback = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] })
+    igProxyUrl = (await fallback?.newUrl(`ig_fb_${Date.now()}`)) ?? null
+    log.info(`IG proxy (residential global): ${igProxyUrl ? igProxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
+  } catch { /* no proxy */ }
 }
 
 try {
-  // Datacenter is cheaper ($0.25/GB vs $10/GB) and FB tolerates it
-  const dcProxy = await Actor.createProxyConfiguration({ groups: ['BUYPROXIES94952'] })
-  fbProxyUrl = (await dcProxy?.newUrl(`fb_session_${Date.now()}`)) ?? null
-  log.info(`FB proxy (datacenter): ${fbProxyUrl ? fbProxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
+  // Polish residential for FB too — FB login wall may be geo-dependent
+  const fbProxy = await Actor.createProxyConfiguration({
+    groups: ['RESIDENTIAL'],
+    countryCode: 'PL',
+  })
+  fbProxyUrl = (await fbProxy?.newUrl(`fb_${Date.now()}`)) ?? null
+  log.info(`FB proxy (residential PL): ${fbProxyUrl ? fbProxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
 } catch {
-  // Fall back to residential for FB if datacenter not available
-  fbProxyUrl = igProxyUrl
-  log.info('FB proxy: falling back to residential')
+  // Fall back to datacenter
+  try {
+    const dcProxy = await Actor.createProxyConfiguration({ groups: ['BUYPROXIES94952'] })
+    fbProxyUrl = (await dcProxy?.newUrl(`fb_dc_${Date.now()}`)) ?? null
+    log.info(`FB proxy (datacenter): ${fbProxyUrl ? fbProxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
+  } catch {
+    fbProxyUrl = igProxyUrl
+    log.info('FB proxy: falling back to IG proxy')
+  }
 }
 
 // --- Optimization #2: Reuse browser contexts (one launch, multiple pages) ---
 const browser = await chromium.launch({
   headless: true,
-  args: ['--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage'],
+  args: [
+    '--disable-gpu',
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-blink-features=AutomationControlled',
+  ],
 })
 
 // Create separate contexts for IG and FB with different proxies
@@ -128,10 +152,13 @@ for (const comp of input.competitors) {
     const handle = comp.instagram.replace(/^@/, '')
     log.info(`  IG: @${handle}`)
     try {
-      // Optimization #5: Fresh proxy session per profile
+      // Optimization #5: Fresh proxy session per profile (Polish IP)
       let profileContext = igContext
       try {
-        const proxyConfig = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] })
+        const proxyConfig = await Actor.createProxyConfiguration({
+          groups: ['RESIDENTIAL'],
+          countryCode: 'PL',
+        })
         const freshProxy = (await proxyConfig?.newUrl(`ig_${handle}_${Date.now()}`)) ?? null
         if (freshProxy && freshProxy !== igProxyUrl) {
           profileContext = await createContext(freshProxy)
