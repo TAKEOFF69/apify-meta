@@ -217,21 +217,26 @@ async function tryWebPageFallback(
 
     const html = await response.text()
 
-    // Parse og:description: "1,234 Followers, 567 Following, 89 Posts - Bio text here"
+    // Parse og:description: "14K Followers, 524 Following, 2,016 Posts - Bio text here"
     const ogMatch = html.match(/<meta\s+(?:property="og:description"\s+content="([^"]+)"|content="([^"]+)"\s+property="og:description")/i)
     const descMatch = html.match(/<meta\s+(?:name="description"\s+content="([^"]+)"|content="([^"]+)"\s+name="description")/i)
     const desc = ogMatch?.[1] ?? ogMatch?.[2] ?? descMatch?.[1] ?? descMatch?.[2]
+
+    log.info(`    [IG web debug] og:description: "${(ogMatch?.[1] ?? ogMatch?.[2] ?? 'null')?.slice(0, 150)}"`)
+    log.info(`    [IG web debug] meta description: "${(descMatch?.[1] ?? descMatch?.[2] ?? 'null')?.slice(0, 150)}"`)
 
     if (!desc) {
       return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: 'No meta description in page HTML' }
     }
 
     const decoded = decodeHtmlEntities(desc)
+    log.info(`    [IG web debug] decoded desc: "${decoded.slice(0, 150)}"`)
 
-    // Parse "1,234 Followers, 567 Following, 89 Posts - Bio"
-    const followersMatch = decoded.match(/([\d,.\s]+)\s*(?:Followers|obserwuj[aą]cych|follower)/i)
-    const followingMatch = decoded.match(/([\d,.\s]+)\s*(?:Following|obserwowanych)/i)
-    const postsMatch = decoded.match(/([\d,.\s]+)\s*(?:Posts|post[oó]w|post)/i)
+    // Parse "14K Followers, 524 Following, 2,016 Posts - Bio"
+    // Use \b word boundary and capture numbers like "14K", "2,016", "524"
+    const followersMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Followers|obserwuj[aą]cych|follower)/i)
+    const followingMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Following|obserwowanych)/i)
+    const postsMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Posts|post[oó]w|post)\b/i)
     const bioMatch = decoded.match(/[-–—]\s*(.+)$/)
 
     return {
