@@ -158,16 +158,28 @@ async function tryWebPage(
   try {
     const url = `https://www.instagram.com/${handle}/`
 
+    // Get cookies first — Instagram serves SSR content more reliably with session cookies
+    const cookies = await getSessionCookies('https://www.instagram.com/', proxyUrl)
+
+    const headers: Record<string, string> = {
+      'User-Agent': randomUserAgent(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+      'Cache-Control': 'max-age=0',
+    }
+
+    if (cookies) {
+      headers['Cookie'] = cookies
+    }
+
     const response = await fetchWithProxy(url, {
-      headers: {
-        'User-Agent': randomUserAgent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-      },
+      headers,
       signal: AbortSignal.timeout(30_000),
       redirect: 'follow',
     }, proxyUrl)
@@ -179,11 +191,14 @@ async function tryWebPage(
     const html = await response.text()
     log.info(`    IG web: ${response.status}, HTML ${html.length} chars`)
 
-    // Quick debug: check what we got
+    // Debug: check what kind of page we got
+    const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
+    const title = titleMatch ? titleMatch[1].trim() : '(no title)'
     const hasMetaTags = html.includes('og:description')
     const hasShortcodes = html.includes('"shortcode"')
     const hasEdgeMedia = html.includes('edge_owner_to_timeline_media')
-    log.info(`    IG web: meta=${hasMetaTags} shortcodes=${hasShortcodes} edgeMedia=${hasEdgeMedia}`)
+    const isLoginPage = html.includes('/accounts/login') || html.includes('loginForm')
+    log.info(`    IG web: title="${title}" meta=${hasMetaTags} shortcodes=${hasShortcodes} edgeMedia=${hasEdgeMedia} login=${isLoginPage}`)
 
     // --- Extract posts from embedded JSON in HTML ---
     const posts = extractPostsFromHtml(html, postsLimit)

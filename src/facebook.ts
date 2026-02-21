@@ -64,18 +64,39 @@ async function tryDesktopPage(
   try {
     const url = `https://www.facebook.com/${pageHandle}/`
 
-    const response = await fetchWithProxy(url, {
+    // Get cookies first — FB serves richer HTML with session cookies
+    const cookieResponse = await fetchWithProxy('https://www.facebook.com/', {
       headers: {
         'User-Agent': randomDesktopUA(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
+        'Accept': 'text/html',
+        'Accept-Language': 'pl-PL,pl;q=0.9,en;q=0.8',
       },
+      signal: AbortSignal.timeout(15_000),
+      redirect: 'follow',
+    }, proxyUrl).catch(() => null)
+
+    let cookies = ''
+    if (cookieResponse) {
+      const setCookies = cookieResponse.headers.getSetCookie?.() ?? []
+      cookies = setCookies.map(c => c.split(';')[0]).join('; ')
+    }
+
+    const headers: Record<string, string> = {
+      'User-Agent': randomDesktopUA(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+      'Cache-Control': 'max-age=0',
+    }
+    if (cookies) headers['Cookie'] = cookies
+
+    const response = await fetchWithProxy(url, {
+      headers,
       signal: AbortSignal.timeout(30_000),
       redirect: 'follow',
     }, proxyUrl)
@@ -87,18 +108,16 @@ async function tryDesktopPage(
     const html = await response.text()
     log.info(`    FB desktop: ${response.status}, HTML ${html.length} chars`)
 
-    // Debug: what patterns exist in the HTML
+    // Debug: what kind of page we got
+    const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
+    const title = titleMatch ? titleMatch[1].trim() : '(no title)'
     const hasOg = html.includes('og:description')
     const hasCreationTime = (html.match(/"creation_time"/g) || []).length
     const hasMessage = (html.match(/"message"\s*:\s*\{/g) || []).length
     const hasReactionCount = (html.match(/"reaction_count"/g) || []).length
     const hasFollowerCount = html.includes('follower_count') || html.includes('fan_count')
-    log.info(`    FB desktop: og=${hasOg} creation_time=${hasCreationTime} messages=${hasMessage} reactions=${hasReactionCount} followerJson=${hasFollowerCount}`)
-
-    // Check if we got a login redirect
-    if (html.includes('login_form') || html.includes('/login/')) {
-      log.warning('    FB desktop: got login page instead of public page')
-    }
+    const isLoginPage = html.includes('login_form') || html.includes('/login/?next')
+    log.info(`    FB desktop: title="${title}" og=${hasOg} creation_time=${hasCreationTime} messages=${hasMessage} reactions=${hasReactionCount} followerJson=${hasFollowerCount} login=${isLoginPage}`)
 
     // Extract posts from embedded JSON (primary goal)
     const posts = extractPostsFromDesktopJson(html, postsLimit)
