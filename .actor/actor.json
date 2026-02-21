@@ -1,0 +1,13 @@
+{
+  "actorSpecification": 1,
+  "name": "twenty50-social-scraper",
+  "title": "Twenty50 Competitor Social Scraper",
+  "version": "1.0",
+  "buildTag": "latest",
+  "dockerfile": "./Dockerfile",
+  "dockerContextDir": ".",
+  "defaultMemoryMbytes": 512,
+  "minMemoryMbytes": 256,
+  "maxMemoryMbytes": 1024,
+  "input": "./input_schema.json"
+}

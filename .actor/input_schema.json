@@ -1,0 +1,33 @@
+{
+  "title": "Twenty50 Social Scraper Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "customer_slug": {
+      "title": "Customer slug",
+      "type": "string",
+      "description": "Customer identifier (e.g., 'vcentrum')"
+    },
+    "competitors": {
+      "title": "Competitors",
+      "type": "array",
+      "description": "List of competitors with social handles",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "instagram": { "type": "string" },
+          "facebook": { "type": "string" }
+        },
+        "required": ["name"]
+      }
+    },
+    "posts_per_profile": {
+      "title": "Posts per profile",
+      "type": "integer",
+      "default": 12,
+      "description": "Number of recent posts to scrape per profile"
+    }
+  },
+  "required": ["customer_slug", "competitors"]
+}
