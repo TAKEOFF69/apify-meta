@@ -33,11 +33,35 @@ const postsLimit = input.posts_per_profile ?? 12
 
 log.info(`Starting social scrape for ${input.customer_slug}: ${input.competitors.length} competitors`)
 
-// Launch browser with Apify proxy (residential for IG, datacenter OK for FB)
-const proxyConfiguration = await Actor.createProxyConfiguration({
-  groups: ['RESIDENTIAL'],
-})
-const proxyUrl = await proxyConfiguration?.newUrl()
+// Launch browser with Apify proxy
+// Try residential first (best for IG), fall back to datacenter proxies
+let proxyConfiguration: Awaited<ReturnType<typeof Actor.createProxyConfiguration>> | null = null
+for (const group of ['RESIDENTIAL', 'BUYPROXIES94952', 'StaticUS3']) {
+  try {
+    proxyConfiguration = await Actor.createProxyConfiguration({ groups: [group] })
+    const testUrl = await proxyConfiguration!.newUrl()
+    if (testUrl) {
+      log.info(`Using proxy group: ${group}`)
+      break
+    }
+  } catch {
+    log.info(`Proxy group ${group} not available, trying next...`)
+    proxyConfiguration = null
+  }
+}
+
+// Fallback: auto proxy (Apify picks the best available)
+if (!proxyConfiguration) {
+  try {
+    proxyConfiguration = await Actor.createProxyConfiguration()
+    log.info('Using auto proxy configuration')
+  } catch {
+    log.warning('No proxy available, running without proxy')
+  }
+}
+
+const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : null
+log.info(`Proxy URL: ${proxyUrl ? proxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
 
 const browser = await chromium.launch({
   headless: true,

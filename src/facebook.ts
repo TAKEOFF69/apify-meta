@@ -32,7 +32,7 @@ export async function scrapeFacebook(
     await page.route('**/*.{mp4,webm,ogg,avi}', (route) => route.abort())
     await page.route('**/video/**', (route) => route.abort())
 
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 })
 
     if (!response || response.status() >= 400) {
       return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${response?.status() ?? 'no response'}` }
