@@ -222,15 +222,11 @@ async function tryWebPageFallback(
     const descMatch = html.match(/<meta\s+(?:name="description"\s+content="([^"]+)"|content="([^"]+)"\s+name="description")/i)
     const desc = ogMatch?.[1] ?? ogMatch?.[2] ?? descMatch?.[1] ?? descMatch?.[2]
 
-    log.info(`    [IG web debug] og:description: "${(ogMatch?.[1] ?? ogMatch?.[2] ?? 'null')?.slice(0, 150)}"`)
-    log.info(`    [IG web debug] meta description: "${(descMatch?.[1] ?? descMatch?.[2] ?? 'null')?.slice(0, 150)}"`)
-
     if (!desc) {
       return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: 'No meta description in page HTML' }
     }
 
     const decoded = decodeHtmlEntities(desc)
-    log.info(`    [IG web debug] decoded desc: "${decoded.slice(0, 150)}"`)
 
     // Parse "14K Followers, 524 Following, 2,016 Posts - Bio"
     // Use \b word boundary and capture numbers like "14K", "2,016", "524"
