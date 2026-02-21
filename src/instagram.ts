@@ -1,235 +1,146 @@
-import type { Browser } from 'playwright'
+import { log } from 'apify'
 import type { CompetitorSocialResult, SocialPost } from './types.js'
 
 /**
- * Scrape an Instagram public profile for followers, post count, and recent posts.
+ * Scrape an Instagram public profile using Instagram's private REST API.
  *
- * Strategy:
- * 1. Navigate to profile page with residential proxy
- * 2. Try extracting structured data from page's embedded JSON
- * 3. Fallback to meta tags + DOM parsing
- * 4. Extract recent posts from the grid
+ * Endpoint: GET https://i.instagram.com/api/v1/users/web_profile_info/?username={handle}
+ * Header:   x-ig-app-id: 936619743392459
+ *
+ * Returns profile JSON with followers, following, posts count, bio,
+ * and recent ~12 posts with like/comment counts.
+ *
+ * Bandwidth: ~50-100 KB per request (vs 3-5 MB with Playwright).
+ * Requires residential proxy to avoid blocking.
  */
 export async function scrapeInstagram(
-  browser: Browser,
   handle: string,
   postsLimit: number,
+  proxyUrl: string | null,
 ): Promise<Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'platform' | 'scraped_at'>> {
-  // Normalize handle — strip @ prefix
   const cleanHandle = handle.replace(/^@/, '')
-  const url = `https://www.instagram.com/${cleanHandle}/`
-
-  const context = await browser.newContext({
-    userAgent: randomUserAgent(),
-    viewport: { width: 1280, height: 900 },
-    locale: 'pl-PL',
-  })
-  const page = await context.newPage()
 
   try {
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    const url = `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(cleanHandle)}`
 
-    if (!response || response.status() >= 400) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${response?.status() ?? 'no response'}` }
+    const headers: Record<string, string> = {
+      'x-ig-app-id': '936619743392459',
+      'User-Agent': randomUserAgent(),
+      'Accept': '*/*',
+      'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Origin': 'https://www.instagram.com',
+      'Referer': 'https://www.instagram.com/',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-site',
     }
 
-    // Wait for content to render
-    await page.waitForTimeout(2000)
+    // Use Apify's proxy via global agent or fetch option
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
+      headers,
+      signal: AbortSignal.timeout(30_000),
+    }
 
-    // Strategy 1: Try to extract from embedded JSON (meta tags or script tags)
-    const profileData = await extractFromMeta(page)
+    // If proxy is available, use undici ProxyAgent
+    let response: Response
+    if (proxyUrl) {
+      const { ProxyAgent } = await import('undici')
+      const agent = new ProxyAgent(proxyUrl)
+      response = await fetch(url, { ...fetchOptions, dispatcher: agent } as RequestInit)
+    } else {
+      response = await fetch(url, fetchOptions)
+    }
 
-    // Strategy 2: DOM parsing fallback
-    const domData = profileData.followers === null ? await extractFromDom(page) : null
+    if (!response.ok) {
+      const status = response.status
+      if (status === 404) {
+        return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `Profile not found: @${cleanHandle}` }
+      }
+      if (status === 401 || status === 403) {
+        return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `Blocked by Instagram (HTTP ${status}) — may need proxy rotation` }
+      }
+      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${status}` }
+    }
 
-    const followers = profileData.followers ?? domData?.followers ?? null
-    const following = profileData.following ?? domData?.following ?? null
-    const postsCount = profileData.postsCount ?? domData?.postsCount ?? null
-    const bio = profileData.bio ?? domData?.bio ?? null
+    const data = await response.json() as InstagramApiResponse
+    const user = data?.data?.user
 
-    // Extract recent posts from grid
-    const recentPosts = await extractPosts(page, postsLimit)
+    if (!user) {
+      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: 'No user data in API response' }
+    }
+
+    // Extract profile metrics
+    const followers = user.edge_followed_by?.count ?? null
+    const following = user.edge_follow?.count ?? null
+    const postsCount = user.edge_owner_to_timeline_media?.count ?? null
+    const bio = user.biography?.slice(0, 300) ?? null
+
+    // Extract recent posts
+    const recentPosts: SocialPost[] = []
+    const edges = user.edge_owner_to_timeline_media?.edges ?? []
+
+    for (const edge of edges.slice(0, postsLimit)) {
+      const node = edge.node
+      if (!node) continue
+
+      const postUrl = `https://www.instagram.com/p/${node.shortcode}/`
+      const caption = node.edge_media_to_caption?.edges?.[0]?.node?.text ?? ''
+      const likes = node.edge_liked_by?.count ?? node.edge_media_preview_like?.count ?? null
+      const comments = node.edge_media_to_comment?.count ?? null
+      const postedAt = node.taken_at_timestamp
+        ? new Date(node.taken_at_timestamp * 1000).toISOString().split('T')[0]
+        : null
+      const mediaType = node.is_video ? 'video' : 'image'
+
+      recentPosts.push({
+        url: postUrl,
+        caption_snippet: caption.slice(0, 300),
+        likes,
+        comments,
+        posted_at: postedAt,
+        media_type: mediaType,
+      })
+    }
 
     return { followers, following, posts_count: postsCount, bio, recent_posts: recentPosts, error: null }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: message }
-  } finally {
-    await context.close()
   }
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 1: Meta tags + og:description parsing
+// Instagram API response types (partial — only what we use)
 // ---------------------------------------------------------------------------
 
-interface ProfileMeta {
-  followers: number | null
-  following: number | null
-  postsCount: number | null
-  bio: string | null
-}
-
-async function extractFromMeta(page: import('playwright').Page): Promise<ProfileMeta> {
-  try {
-    // og:description often contains "X Followers, Y Following, Z Posts - ..."
-    const ogDesc = await page.getAttribute('meta[property="og:description"]', 'content')
-    if (ogDesc) {
-      const parsed = parseOgDescription(ogDesc)
-      if (parsed.followers !== null) return parsed
-    }
-
-    // Try description meta tag
-    const desc = await page.getAttribute('meta[name="description"]', 'content')
-    if (desc) {
-      return parseOgDescription(desc)
-    }
-  } catch {
-    // Ignore — fallback to DOM
-  }
-  return { followers: null, following: null, postsCount: null, bio: null }
-}
-
-/**
- * Parse Instagram's og:description format:
- * "1,234 Followers, 567 Following, 89 Posts - Bio text here"
- * or Polish: "1 234 obserwujących, 567 obserwowanych, 89 postów"
- */
-function parseOgDescription(text: string): ProfileMeta {
-  const result: ProfileMeta = { followers: null, following: null, postsCount: null, bio: null }
-
-  // Extract followers
-  const followersMatch = text.match(/([\d,.\s]+)\s*(?:Followers|obserwujących|follower)/i)
-  if (followersMatch) result.followers = parseCount(followersMatch[1])
-
-  // Extract following
-  const followingMatch = text.match(/([\d,.\s]+)\s*(?:Following|obserwowanych)/i)
-  if (followingMatch) result.following = parseCount(followingMatch[1])
-
-  // Extract posts count
-  const postsMatch = text.match(/([\d,.\s]+)\s*(?:Posts|postów|post)/i)
-  if (postsMatch) result.postsCount = parseCount(postsMatch[1])
-
-  // Extract bio (after the dash separator)
-  const bioMatch = text.match(/[-–—]\s*(.+)$/)
-  if (bioMatch) result.bio = bioMatch[1].trim().slice(0, 300)
-
-  return result
-}
-
-// ---------------------------------------------------------------------------
-// Strategy 2: DOM parsing
-// ---------------------------------------------------------------------------
-
-async function extractFromDom(page: import('playwright').Page): Promise<ProfileMeta> {
-  try {
-    // Instagram renders follower counts in various selectors depending on version
-    // Try common patterns
-    const statsText = await page.evaluate(() => {
-      // Look for the stats section (followers/following/posts)
-      const headerSection = document.querySelector('header section')
-      if (!headerSection) return null
-
-      // Get all list items in the header that typically contain stats
-      const items = headerSection.querySelectorAll('li, span[title]')
-      const texts: string[] = []
-      items.forEach((item) => {
-        const text = item.textContent?.trim()
-        if (text) texts.push(text)
-      })
-      return texts.join(' | ')
-    })
-
-    if (!statsText) return { followers: null, following: null, postsCount: null, bio: null }
-
-    // Try to parse numbers from stats text
-    const numbers = statsText.match(/[\d,.\s]+/g)?.map(parseCount).filter((n) => n !== null) ?? []
-
-    // Bio from header
-    const bio = await page.evaluate(() => {
-      const bioEl = document.querySelector('header section div.-vDIg span, header section div span[dir="auto"]')
-      return bioEl?.textContent?.trim()?.slice(0, 300) ?? null
-    })
-
-    // Instagram typically shows: posts | followers | following (in that order)
-    return {
-      postsCount: numbers[0] ?? null,
-      followers: numbers[1] ?? null,
-      following: numbers[2] ?? null,
-      bio,
-    }
-  } catch {
-    return { followers: null, following: null, postsCount: null, bio: null }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Post extraction from grid
-// ---------------------------------------------------------------------------
-
-async function extractPosts(page: import('playwright').Page, limit: number): Promise<SocialPost[]> {
-  try {
-    const posts = await page.evaluate((lim: number) => {
-      const results: { url: string; caption: string; likes: string | null; type: string | null }[] = []
-
-      // Posts are typically in article or div[role="presentation"] links
-      const postLinks = document.querySelectorAll('article a[href*="/p/"], article a[href*="/reel/"], main a[href*="/p/"], main a[href*="/reel/"]')
-
-      for (const link of postLinks) {
-        if (results.length >= lim) break
-        const href = (link as HTMLAnchorElement).href
-        if (!href) continue
-
-        // Try to get alt text (Instagram puts captions in img alt)
-        const img = link.querySelector('img')
-        const caption = img?.alt ?? ''
-
-        // Try to find likes text in parent
-        const parent = link.closest('article') ?? link.parentElement
-        const likesEl = parent?.querySelector('span[class*="like"], button[class*="like"] span')
-        const likesText = likesEl?.textContent ?? null
-
-        // Detect media type from the element
-        const hasVideo = !!link.querySelector('svg[aria-label*="Reel"], svg[aria-label*="Video"], span[class*="reel"]')
-        const type = hasVideo ? 'video' : 'image'
-
-        results.push({ url: href, caption: caption.slice(0, 300), likes: likesText, type })
+interface InstagramApiResponse {
+  data?: {
+    user?: {
+      biography?: string
+      edge_followed_by?: { count: number }
+      edge_follow?: { count: number }
+      edge_owner_to_timeline_media?: {
+        count: number
+        edges: {
+          node: {
+            shortcode: string
+            taken_at_timestamp?: number
+            is_video?: boolean
+            edge_media_to_caption?: { edges: { node: { text: string } }[] }
+            edge_liked_by?: { count: number }
+            edge_media_preview_like?: { count: number }
+            edge_media_to_comment?: { count: number }
+          }
+        }[]
       }
-      return results
-    }, limit)
-
-    return posts.map((p) => ({
-      url: p.url,
-      caption_snippet: p.caption,
-      likes: p.likes ? parseCount(p.likes) : null,
-      comments: null, // Not reliably extractable from grid view
-      posted_at: null, // Not reliably extractable from grid view
-      media_type: p.type,
-    }))
-  } catch {
-    return []
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function parseCount(text: string): number | null {
-  // Handle formats: "1,234" | "1.234" | "1 234" | "12.5K" | "1.2M"
-  const cleaned = text.trim().replace(/\s/g, '')
-  const multiplierMatch = cleaned.match(/([\d,.]+)\s*([KkMm])?/)
-  if (!multiplierMatch) return null
-
-  let num = parseFloat(multiplierMatch[1].replace(',', '.'))
-  if (isNaN(num)) return null
-
-  const multiplier = multiplierMatch[2]?.toUpperCase()
-  if (multiplier === 'K') num *= 1000
-  if (multiplier === 'M') num *= 1_000_000
-
-  return Math.round(num)
-}
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',

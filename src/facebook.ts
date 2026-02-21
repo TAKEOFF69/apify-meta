@@ -1,217 +1,185 @@
-import type { Browser } from 'playwright'
+import { log } from 'apify'
 import type { CompetitorSocialResult, SocialPost } from './types.js'
 
 /**
- * Scrape a Facebook public page for followers, post count, and recent posts.
+ * Scrape a Facebook public page via HTTP fetch (no browser).
  *
  * Strategy:
- * 1. Navigate to the page URL
- * 2. Extract page info (name, followers, category) from visible DOM
- * 3. Scroll down to load recent posts
- * 4. Extract post text, reactions, comments, shares from visible cards
+ * 1. Fetch page HTML via residential proxy
+ * 2. Extract og:description for follower/like counts
+ * 3. Parse JSON-LD structured data for page info
+ * 4. Extract recent posts from embedded data if available
  *
  * Facebook public pages are accessible without login.
- * Datacenter proxies typically work (FB is less aggressive than IG).
+ * Bandwidth: ~100-300 KB per request (vs 3-5 MB with Playwright).
  */
 export async function scrapeFacebook(
-  browser: Browser,
   pageHandle: string,
   postsLimit: number,
+  proxyUrl: string | null,
 ): Promise<Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'platform' | 'scraped_at'>> {
   const url = `https://www.facebook.com/${pageHandle}/`
 
-  const context = await browser.newContext({
-    userAgent: randomUserAgent(),
-    viewport: { width: 1280, height: 900 },
-    locale: 'pl-PL',
-  })
-  const page = await context.newPage()
-
   try {
-    // Block heavy resources to speed up loading
-    await page.route('**/*.{mp4,webm,ogg,avi}', (route) => route.abort())
-    await page.route('**/video/**', (route) => route.abort())
-
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-
-    if (!response || response.status() >= 400) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${response?.status() ?? 'no response'}` }
+    const headers: Record<string, string> = {
+      'User-Agent': randomUserAgent(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
     }
 
-    // Handle cookie consent popup (common in EU)
-    await dismissCookiePopup(page)
+    let response: Response
+    if (proxyUrl) {
+      const { ProxyAgent } = await import('undici')
+      const agent = new ProxyAgent(proxyUrl)
+      response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(30_000),
+        redirect: 'follow',
+        dispatcher: agent,
+      } as RequestInit)
+    } else {
+      response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(30_000),
+        redirect: 'follow',
+      })
+    }
 
-    // Wait for content to render
-    await page.waitForTimeout(3000)
+    if (!response.ok) {
+      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${response.status}` }
+    }
 
-    // Extract page info
-    const pageInfo = await extractPageInfo(page)
+    const html = await response.text()
 
-    // Scroll to load posts
-    await scrollForPosts(page, 3) // 3 scroll attempts
-
-    // Extract posts
-    const recentPosts = await extractPosts(page, postsLimit)
+    // Extract data from HTML
+    const followers = extractFollowers(html)
+    const bio = extractBio(html)
+    const recentPosts = extractPostsFromHtml(html, postsLimit)
 
     return {
-      followers: pageInfo.followers,
-      following: null, // FB pages don't show "following" count
-      posts_count: null, // Not easily available on page profiles
-      bio: pageInfo.bio,
+      followers,
+      following: null, // FB pages don't expose "following" count
+      posts_count: null, // Not reliably available in HTML
+      bio,
       recent_posts: recentPosts,
       error: null,
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: message }
-  } finally {
-    await context.close()
   }
 }
 
 // ---------------------------------------------------------------------------
-// Cookie popup dismissal
+// Follower extraction from HTML
 // ---------------------------------------------------------------------------
 
-async function dismissCookiePopup(page: import('playwright').Page): Promise<void> {
-  try {
-    // Facebook shows various cookie consent buttons
-    const selectors = [
-      'button[data-cookiebanner="accept_button"]',
-      'button[title="Allow all cookies"]',
-      'button[title="Zezwól na wszystkie pliki cookie"]',
-      'div[role="dialog"] button:has-text("Allow")',
-      'div[role="dialog"] button:has-text("Zezwól")',
-    ]
-    for (const sel of selectors) {
-      const btn = await page.$(sel)
-      if (btn) {
-        await btn.click()
-        await page.waitForTimeout(1000)
-        return
-      }
-    }
-  } catch {
-    // Ignore — popup may not exist
+function extractFollowers(html: string): number | null {
+  // Strategy 1: og:description — "1,234 people like this" or Polish variant
+  const ogMatch = html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i)
+    ?? html.match(/<meta\s+content="([^"]+)"\s+property="og:description"/i)
+  if (ogMatch) {
+    const desc = ogMatch[1]
+
+    // Polish: "1 234 osób lubi to" or "1 234 obserwujących"
+    const plMatch = desc.match(/([\d\s,.]+)\s*(?:osób lubi|obserwujących|polubień)/i)
+    if (plMatch) return parseCount(plMatch[1])
+
+    // English: "1,234 people like this" or "1,234 followers"
+    const enMatch = desc.match(/([\d\s,.]+)\s*(?:people like|followers|likes)/i)
+    if (enMatch) return parseCount(enMatch[1])
   }
-}
 
-// ---------------------------------------------------------------------------
-// Page info extraction
-// ---------------------------------------------------------------------------
-
-interface PageInfo {
-  followers: number | null
-  bio: string | null
-}
-
-async function extractPageInfo(page: import('playwright').Page): Promise<PageInfo> {
-  try {
-    const data = await page.evaluate(() => {
-      let followers: string | null = null
-      let bio: string | null = null
-
-      // Look for follower count — FB shows it in various formats
-      // Common patterns: "1,234 people like this" / "1 234 osób lubi to"
-      // or "1,234 followers" / "1 234 obserwujących"
-      const allText = document.body.innerText
-
-      // Try Polish format first
-      const plFollowers = allText.match(/([\d\s,.]+)\s*(?:obserwujących|osób lubi|osób to lubi|polubień)/i)
-      if (plFollowers) followers = plFollowers[1]
-
-      // English fallback
-      if (!followers) {
-        const enFollowers = allText.match(/([\d\s,.]+)\s*(?:followers|people like|likes)/i)
-        if (enFollowers) followers = enFollowers[1]
-      }
-
-      // Bio / About text — typically in a span/div near the top
-      const aboutSection = document.querySelector('[data-pagelet="ProfileTilesFeed_0"]')
-        ?? document.querySelector('div[class*="about"]')
-      if (aboutSection) {
-        bio = aboutSection.textContent?.trim()?.slice(0, 300) ?? null
-      }
-
-      return { followers, bio }
-    })
-
-    return {
-      followers: data.followers ? parseCount(data.followers) : null,
-      bio: data.bio,
-    }
-  } catch {
-    return { followers: null, bio: null }
+  // Strategy 2: Look for follower count in page meta
+  const metaDesc = html.match(/<meta\s+name="description"\s+content="([^"]+)"/i)
+  if (metaDesc) {
+    const desc = metaDesc[1]
+    const plMatch = desc.match(/([\d\s,.]+)\s*(?:osób lubi|obserwujących|polubień)/i)
+    if (plMatch) return parseCount(plMatch[1])
+    const enMatch = desc.match(/([\d\s,.]+)\s*(?:people like|followers|likes)/i)
+    if (enMatch) return parseCount(enMatch[1])
   }
+
+  // Strategy 3: JSON blob in page source (Facebook embeds data as JSON)
+  const followerJsonMatch = html.match(/"follower_count"\s*:\s*(\d+)/i)
+    ?? html.match(/"followers_count"\s*:\s*(\d+)/i)
+    ?? html.match(/"fan_count"\s*:\s*(\d+)/i)
+  if (followerJsonMatch) return parseInt(followerJsonMatch[1], 10)
+
+  return null
 }
 
 // ---------------------------------------------------------------------------
-// Scroll to load posts
+// Bio / About extraction
 // ---------------------------------------------------------------------------
 
-async function scrollForPosts(page: import('playwright').Page, scrollCount: number): Promise<void> {
-  for (let i = 0; i < scrollCount; i++) {
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.5))
-    await page.waitForTimeout(1500 + Math.random() * 1000)
+function extractBio(html: string): string | null {
+  // og:description often has bio after the follower info
+  const ogMatch = html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i)
+    ?? html.match(/<meta\s+content="([^"]+)"\s+property="og:description"/i)
+  if (ogMatch) {
+    const desc = ogMatch[1]
+    // Bio is typically after the stats portion, separated by dash or period
+    const bioMatch = desc.match(/[-–—.]\s*(.{10,})$/)
+    if (bioMatch) return bioMatch[1].trim().slice(0, 300)
   }
+
+  // Try page title for basic info
+  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i)
+  if (titleMatch) {
+    const title = titleMatch[1].replace(/\s*[-|]\s*Facebook.*$/i, '').trim()
+    if (title.length > 5) return title.slice(0, 300)
+  }
+
+  return null
 }
 
 // ---------------------------------------------------------------------------
-// Post extraction
+// Post extraction from embedded HTML data
 // ---------------------------------------------------------------------------
 
-async function extractPosts(page: import('playwright').Page, limit: number): Promise<SocialPost[]> {
-  try {
-    const rawPosts = await page.evaluate((lim: number) => {
-      const results: { text: string; reactions: string | null; comments: string | null; shares: string | null; url: string | null; time: string | null }[] = []
+function extractPostsFromHtml(html: string, limit: number): SocialPost[] {
+  const posts: SocialPost[] = []
 
-      // Facebook posts are typically in div[role="article"] or similar
-      const articles = document.querySelectorAll('div[role="article"], div[data-pagelet*="FeedUnit"]')
+  // Facebook embeds post data as JSON blobs in the HTML
+  const postPattern = /"message"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]{10,300})"/g
+  let match: RegExpExecArray | null
+  let count = 0
 
-      for (const article of articles) {
-        if (results.length >= lim) break
+  while ((match = postPattern.exec(html)) !== null && count < limit) {
+    const text = match[1]
+      .replace(/\\n/g, ' ')
+      .replace(/\\u[\da-fA-F]{4}/g, '')
+      .trim()
 
-        // Post text — look for the main text content
-        const textEl = article.querySelector('div[data-ad-preview="message"], div[dir="auto"]')
-        const text = textEl?.textContent?.trim() ?? ''
-        if (!text || text.length < 10) continue // Skip empty/tiny posts
+    if (text.length < 10) continue
 
-        // Reactions count (likes + other reactions)
-        const reactionsEl = article.querySelector('span[class*="reaction"], div[aria-label*="reaction"], span[aria-label*="reakcj"]')
-        const reactions = reactionsEl?.textContent ?? reactionsEl?.getAttribute('aria-label') ?? null
-
-        // Comments count
-        const commentsEl = article.querySelector('span:has-text("comment"), span:has-text("komentarz")')
-        const comments = commentsEl?.textContent ?? null
-
-        // Shares count
-        const sharesEl = article.querySelector('span:has-text("share"), span:has-text("udostępni")')
-        const shares = sharesEl?.textContent ?? null
-
-        // Post URL — look for timestamp link
-        const linkEl = article.querySelector('a[href*="/posts/"], a[href*="/permalink/"], a[role="link"][tabindex="0"]')
-        const url = (linkEl as HTMLAnchorElement)?.href ?? null
-
-        // Timestamp
-        const timeEl = article.querySelector('abbr[data-utime], span[id*="jsc_c"] a, a[role="link"] span')
-        const time = timeEl?.textContent ?? null
-
-        results.push({ text: text.slice(0, 300), reactions, comments, shares, url, time })
-      }
-      return results
-    }, limit)
-
-    return rawPosts.map((p) => ({
-      url: p.url ?? '',
-      caption_snippet: p.text,
-      likes: p.reactions ? extractNumber(p.reactions) : null,
-      comments: p.comments ? extractNumber(p.comments) : null,
-      posted_at: p.time,
+    posts.push({
+      url: '',
+      caption_snippet: text.slice(0, 300),
+      likes: null,
+      comments: null,
+      posted_at: null,
       media_type: null,
-    }))
-  } catch {
-    return []
+    })
+    count++
   }
+
+  // Try to extract reaction counts from nearby JSON
+  const reactionPattern = /"reaction_count"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)/g
+  let reactionIdx = 0
+  while ((match = reactionPattern.exec(html)) !== null && reactionIdx < posts.length) {
+    posts[reactionIdx].likes = parseInt(match[1], 10)
+    reactionIdx++
+  }
+
+  return posts
 }
 
 // ---------------------------------------------------------------------------
@@ -231,12 +199,6 @@ function parseCount(text: string): number | null {
   if (mult === 'M') num *= 1_000_000
 
   return Math.round(num)
-}
-
-function extractNumber(text: string): number | null {
-  const match = text.match(/([\d,.\s]+)/)
-  if (!match) return null
-  return parseCount(match[1])
 }
 
 const USER_AGENTS = [

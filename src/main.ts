@@ -1,5 +1,4 @@
 import { Actor, log } from 'apify'
-import { chromium } from 'playwright'
 import { scrapeInstagram } from './instagram.js'
 import { scrapeFacebook } from './facebook.js'
 import type { ActorInput, CompetitorSocialResult } from './types.js'
@@ -33,40 +32,26 @@ const postsLimit = input.posts_per_profile ?? 12
 
 log.info(`Starting social scrape for ${input.customer_slug}: ${input.competitors.length} competitors`)
 
-// Launch browser with Apify proxy
-// Try residential first (best for IG), fall back to datacenter proxies
-let proxyConfiguration: Awaited<ReturnType<typeof Actor.createProxyConfiguration>> | null = null
-for (const group of ['BUYPROXIES94952', 'RESIDENTIAL', 'StaticUS3']) {
+// Get residential proxy URL — primary choice for IG/FB
+let proxyUrl: string | null = null
+try {
+  const proxyConfiguration = await Actor.createProxyConfiguration({
+    groups: ['RESIDENTIAL'],
+  })
+  proxyUrl = (await proxyConfiguration?.newUrl()) ?? null
+  log.info(`Residential proxy: ${proxyUrl ? proxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
+} catch (err) {
+  log.warning(`Residential proxy not available: ${err}. Trying datacenter fallback.`)
   try {
-    proxyConfiguration = await Actor.createProxyConfiguration({ groups: [group] })
-    const testUrl = await proxyConfiguration!.newUrl()
-    if (testUrl) {
-      log.info(`Using proxy group: ${group}`)
-      break
-    }
-  } catch {
-    log.info(`Proxy group ${group} not available, trying next...`)
-    proxyConfiguration = null
-  }
-}
-
-// Fallback: auto proxy (Apify picks the best available)
-if (!proxyConfiguration) {
-  try {
-    proxyConfiguration = await Actor.createProxyConfiguration()
-    log.info('Using auto proxy configuration')
+    const dcProxy = await Actor.createProxyConfiguration({
+      groups: ['BUYPROXIES94952'],
+    })
+    proxyUrl = (await dcProxy?.newUrl()) ?? null
+    log.info(`Datacenter proxy fallback: ${proxyUrl ? proxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
   } catch {
     log.warning('No proxy available, running without proxy')
   }
 }
-
-const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : null
-log.info(`Proxy URL: ${proxyUrl ? proxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`)
-
-const browser = await chromium.launch({
-  headless: true,
-  proxy: proxyUrl ? { server: proxyUrl } : undefined,
-})
 
 let successCount = 0
 let errorCount = 0
@@ -74,11 +59,19 @@ let errorCount = 0
 for (const comp of input.competitors) {
   log.info(`Scraping competitor: ${comp.name}`)
 
-  // Instagram
+  // Instagram (via private REST API — ~50KB per request)
   if (comp.instagram) {
-    log.info(`  IG: @${comp.instagram.replace(/^@/, '')}`)
+    const handle = comp.instagram.replace(/^@/, '')
+    log.info(`  IG: @${handle}`)
     try {
-      const result = await scrapeInstagram(browser, comp.instagram, postsLimit)
+      // Get a fresh proxy URL per request for IP rotation
+      let igProxyUrl = proxyUrl
+      try {
+        const proxyConfig = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] })
+        igProxyUrl = (await proxyConfig?.newUrl(`ig_${handle}_${Date.now()}`)) ?? proxyUrl
+      } catch { /* use existing */ }
+
+      const result = await scrapeInstagram(handle, postsLimit, igProxyUrl)
       const data: CompetitorSocialResult = {
         customer_slug: input.customer_slug,
         name: comp.name,
@@ -113,14 +106,21 @@ for (const comp of input.competitors) {
     }
 
     // Polite delay between profiles
-    await sleep(randomBetween(3000, 8000))
+    await sleep(randomBetween(2000, 5000))
   }
 
-  // Facebook
+  // Facebook (via HTTP HTML fetch — ~100-300KB per request)
   if (comp.facebook) {
     log.info(`  FB: ${comp.facebook}`)
     try {
-      const result = await scrapeFacebook(browser, comp.facebook, postsLimit)
+      // Fresh proxy URL for FB
+      let fbProxyUrl = proxyUrl
+      try {
+        const proxyConfig = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] })
+        fbProxyUrl = (await proxyConfig?.newUrl(`fb_${comp.facebook}_${Date.now()}`)) ?? proxyUrl
+      } catch { /* use existing */ }
+
+      const result = await scrapeFacebook(comp.facebook, postsLimit, fbProxyUrl)
       const data: CompetitorSocialResult = {
         customer_slug: input.customer_slug,
         name: comp.name,
@@ -155,14 +155,12 @@ for (const comp of input.competitors) {
     }
 
     // Polite delay
-    await sleep(randomBetween(3000, 8000))
+    await sleep(randomBetween(2000, 5000))
   }
 
   // Extra delay between competitors
-  await sleep(randomBetween(2000, 5000))
+  await sleep(randomBetween(1000, 3000))
 }
-
-await browser.close()
 
 log.info(`Done: ${successCount} profiles scraped, ${errorCount} errors`)
 await Actor.exit()
