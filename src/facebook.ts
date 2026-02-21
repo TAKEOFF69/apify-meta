@@ -1,18 +1,18 @@
 import { log } from 'apify'
-import { gotScraping } from 'got-scraping'
+import { Impit } from 'impit'
 import type { CompetitorSocialResult, SocialPost } from './types.js'
 
 type ProfileResult = Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'platform' | 'scraped_at'>
 
 /**
- * Scrape a Facebook public page — focused on POST ENGAGEMENT data.
- *
- * Uses got-scraping (browser TLS fingerprint) to get SSR content from Meta.
- * Regular fetch gets a JS-only shell with no content.
+ * Scrape a Facebook public page using IMPIT (Rust TLS impersonation).
  *
  * Strategy cascade:
  * 1. Desktop HTML (www.facebook.com) — embedded JSON: posts, reactions, comments
  * 2. Mobile HTML (mbasic.facebook.com) — simpler HTML, fallback for post text
+ *
+ * IMPIT impersonates Chrome's exact TLS fingerprint, so Meta serves
+ * SSR content instead of JS-only shells.
  */
 export async function scrapeFacebook(
   pageHandle: string,
@@ -49,7 +49,7 @@ export async function scrapeFacebook(
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 1: Desktop page via got-scraping
+// Strategy 1: Desktop page via IMPIT
 // ---------------------------------------------------------------------------
 
 async function tryDesktopPage(
@@ -58,26 +58,32 @@ async function tryDesktopPage(
   proxyUrl: string | null,
 ): Promise<ProfileResult | null> {
   try {
+    const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
     const url = `https://www.facebook.com/${pageHandle}/`
 
-    const response = await gotScraping({
-      url,
-      proxyUrl: proxyUrl ?? undefined,
-      timeout: { request: 30_000 },
-      followRedirect: true,
-      headerGeneratorOptions: {
-        browsers: [{ name: 'chrome', minVersion: 120 }],
-        operatingSystems: ['windows'],
-        locales: ['pl-PL'],
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30_000)
+
+    const resp = await impit.fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+        'upgrade-insecure-requests': '1',
       },
     })
+    clearTimeout(timeout)
 
-    if (response.statusCode !== 200) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${response.statusCode}` }
+    if (resp.status !== 200) {
+      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${resp.status}` }
     }
 
-    const html = response.body
-    log.info(`    FB desktop: ${response.statusCode}, HTML ${html.length} chars`)
+    const html = await resp.text()
+    log.info(`    FB desktop: ${resp.status}, HTML ${html.length} chars`)
 
     // Debug: what patterns exist
     const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
@@ -109,7 +115,7 @@ async function tryDesktopPage(
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 2: mbasic page via got-scraping
+// Strategy 2: mbasic page via IMPIT
 // ---------------------------------------------------------------------------
 
 async function tryMbasicPage(
@@ -118,27 +124,31 @@ async function tryMbasicPage(
   proxyUrl: string | null,
 ): Promise<ProfileResult | null> {
   try {
+    const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
     const url = `https://mbasic.facebook.com/${pageHandle}/`
 
-    const response = await gotScraping({
-      url,
-      proxyUrl: proxyUrl ?? undefined,
-      timeout: { request: 30_000 },
-      followRedirect: true,
-      headerGeneratorOptions: {
-        browsers: [{ name: 'chrome', minVersion: 120 }],
-        devices: ['mobile'],
-        operatingSystems: ['android'],
-        locales: ['pl-PL'],
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30_000)
+
+    const resp = await impit.fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'upgrade-insecure-requests': '1',
       },
     })
+    clearTimeout(timeout)
 
-    if (response.statusCode !== 200) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `mbasic HTTP ${response.statusCode}` }
+    if (resp.status !== 200) {
+      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `mbasic HTTP ${resp.status}` }
     }
 
-    const html = response.body
-    log.info(`    FB mbasic: ${response.statusCode}, HTML ${html.length} chars`)
+    const html = await resp.text()
+    log.info(`    FB mbasic: ${resp.status}, HTML ${html.length} chars`)
     const hasStoryLinks = (html.match(/story\.php/g) || []).length
     const hasDataFt = (html.match(/data-ft/g) || []).length
     const isLoginPage = html.includes('login_form') || html.includes('/login/')
@@ -341,7 +351,7 @@ function extractPostsFromMbasic(html: string, limit: number): SocialPost[] {
 // ---------------------------------------------------------------------------
 
 function extractMbasicFollowers(html: string): number | null {
-  const likeMatch = html.match(/([\d,.\s]+)\s*(?:people like this|osób lubi|people follow)/i)
+  const likeMatch = html.match(/([\d,.\s]+)\s*(?:people like this|os[oó]b lubi|people follow)/i)
   if (likeMatch) return parseCount(likeMatch[1])
   return null
 }
@@ -379,7 +389,7 @@ function extractBio(html: string): string | null {
     ?? html.match(/<meta\s+content="([^"]+)"\s+property="og:description"/i)
   if (ogMatch) {
     const desc = decodeHtmlEntities(ogMatch[1])
-    const bioMatch = desc.match(/[-–—·.]\s*(.{10,})$/)
+    const bioMatch = desc.match(/[-\u2013\u2014\u00b7.]\s*(.{10,})$/)
     if (bioMatch) return bioMatch[1].trim().slice(0, 300)
   }
 

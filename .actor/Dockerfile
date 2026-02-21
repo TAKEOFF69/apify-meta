@@ -1,7 +1,7 @@
 FROM apify/actor-node:20
 
 COPY package*.json ./
-RUN npm install --include=dev --ignore-scripts
+RUN npm install --include=dev
 
 COPY tsconfig.json ./
 COPY src/ ./src/

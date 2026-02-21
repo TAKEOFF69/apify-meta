@@ -1,18 +1,20 @@
-import { Actor, log } from 'apify'
-import { gotScraping } from 'got-scraping'
+import { log } from 'apify'
+import { Impit } from 'impit'
 import type { CompetitorSocialResult, SocialPost } from './types.js'
 
 type ProfileResult = Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'platform' | 'scraped_at'>
 
+const IG_APP_ID = '936619743392459'
+
 /**
- * Scrape an Instagram public profile — focused on POST ENGAGEMENT data.
+ * Scrape an Instagram public profile using IMPIT (Rust TLS impersonation).
  *
  * Strategy cascade:
- * 1. Private REST API — full data: profile + posts with likes/comments/dates
- * 2. Web page via got-scraping (browser TLS fingerprint) — embedded JSON + meta tags
+ * 1. REST API (/api/v1/users/web_profile_info/) — JSON with profile + posts + engagement
+ * 2. Web HTML (instagram.com/{handle}/) — extract from embedded JSON / meta tags
  *
- * got-scraping mimics browser TLS fingerprint so Meta serves SSR content
- * instead of a JS-only shell (which regular fetch gets).
+ * IMPIT impersonates Chrome's exact TLS fingerprint at the Rust level,
+ * so Meta serves SSR content instead of JS-only shells.
  */
 export async function scrapeInstagram(
   handle: string,
@@ -21,116 +23,99 @@ export async function scrapeInstagram(
 ): Promise<ProfileResult> {
   const cleanHandle = handle.replace(/^@/, '')
 
-  // Strategy 1: Private REST API — best data (posts with full engagement)
-  const apiResult = await tryPrivateApi(cleanHandle, postsLimit, proxyUrl)
-  if (apiResult && !apiResult.error && apiResult.recent_posts.length > 0) return apiResult
-
-  // Strategy 1b: Retry API with fresh proxy IP (429 is often IP-specific)
-  if (apiResult?.error?.includes('429') && proxyUrl) {
-    log.info(`    IG API 429 — retrying with fresh proxy IP after 5s delay`)
-    await sleep(5000)
-    const freshProxyUrl = await getFreshProxyUrl(proxyUrl)
-    const retryResult = await tryPrivateApi(cleanHandle, postsLimit, freshProxyUrl)
-    if (retryResult && !retryResult.error && retryResult.recent_posts.length > 0) return retryResult
+  // Strategy 1: REST API (structured JSON, ~50KB)
+  const apiResult = await tryRestApi(cleanHandle, postsLimit, proxyUrl)
+  if (apiResult && apiResult.recent_posts.length > 0) {
+    log.info(`    IG API: ${apiResult.followers ?? '?'} followers, ${apiResult.recent_posts.length} posts`)
+    return apiResult
   }
 
-  // Strategy 2: Web page via got-scraping — browser TLS fingerprint gets SSR content
-  log.info(`    IG API: ${apiResult?.error ?? 'no posts'}, trying web page (got-scraping)`)
-  const webResult = await tryWebPage(cleanHandle, postsLimit, proxyUrl)
-
-  if (webResult && webResult.recent_posts.length > 0) return webResult
-
-  if (webResult && webResult.followers !== null) {
-    return {
-      ...webResult,
-      error: webResult.recent_posts.length === 0
-        ? 'Profile metrics OK but no post engagement data'
-        : null,
-    }
+  // Strategy 2: Web page HTML with embedded JSON
+  log.info(`    IG API gave ${apiResult?.recent_posts.length ?? 0} posts (${apiResult?.error ?? 'no error'}), trying web HTML`)
+  const webResult = await tryWebHtml(cleanHandle, postsLimit, proxyUrl)
+  if (webResult && (webResult.recent_posts.length > 0 || webResult.followers !== null)) {
+    log.info(`    IG web: ${webResult.followers ?? '?'} followers, ${webResult.recent_posts.length} posts`)
+    return webResult
   }
 
   return apiResult ?? webResult ?? {
     followers: null, following: null, posts_count: null, bio: null,
-    recent_posts: [], error: 'All strategies failed',
+    recent_posts: [], error: 'All Instagram strategies failed',
   }
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 1: Instagram private REST API
+// Strategy 1: Instagram REST API
 // ---------------------------------------------------------------------------
 
-async function tryPrivateApi(
+async function tryRestApi(
   handle: string,
   postsLimit: number,
   proxyUrl: string | null,
 ): Promise<ProfileResult | null> {
   try {
-    // Visit the profile page first to get session cookies (via got-scraping for better TLS)
-    const sessionCookies = await getSessionCookies(
-      `https://www.instagram.com/${handle}/`,
-      proxyUrl,
-    )
-
-    await sleep(randomBetween(1500, 3000))
+    const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
 
     const url = `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(handle)}`
 
-    const headers: Record<string, string> = {
-      'x-ig-app-id': '936619743392459',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Origin': 'https://www.instagram.com',
-      'Referer': `https://www.instagram.com/${handle}/`,
-      'X-Requested-With': 'XMLHttpRequest',
-    }
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30_000)
 
-    if (sessionCookies) {
-      headers['Cookie'] = sessionCookies
-      const csrfMatch = sessionCookies.match(/csrftoken=([^;]+)/)
-      if (csrfMatch) headers['X-CSRFToken'] = csrfMatch[1]
-    }
-
-    // Use got-scraping for the API call too — browser TLS fingerprint helps
-    const response = await gotScraping({
-      url,
-      headers,
-      proxyUrl: proxyUrl ?? undefined,
-      timeout: { request: 30_000 },
-      headerGeneratorOptions: {
-        browsers: [{ name: 'chrome', minVersion: 120 }],
-        operatingSystems: ['windows'],
-        locales: ['en-US'],
+    const resp = await impit.fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'x-ig-app-id': IG_APP_ID,
+        'x-requested-with': 'XMLHttpRequest',
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.9',
+        'referer': `https://www.instagram.com/${handle}/`,
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-site',
       },
     })
+    clearTimeout(timeout)
 
-    if (response.statusCode !== 200) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${response.statusCode}` }
+    log.info(`    IG API: HTTP ${resp.status}`)
+
+    if (resp.status === 429) {
+      log.warning('    IG API: Rate limited (429)')
+      return null
     }
 
-    const data = JSON.parse(response.body) as InstagramApiResponse
-    const user = data?.data?.user
+    if (resp.status !== 200) {
+      log.info(`    IG API: Non-200 status ${resp.status}`)
+      return null
+    }
 
+    const json = await resp.json() as any
+    const user = json?.data?.user ?? json?.user
     if (!user) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: 'No user data in API response' }
+      log.info('    IG API: No user object in response')
+      return null
     }
 
-    const followers = user.edge_followed_by?.count ?? null
-    const following = user.edge_follow?.count ?? null
-    const postsCount = user.edge_owner_to_timeline_media?.count ?? null
-    const bio = user.biography?.slice(0, 300) ?? null
+    const followers = user.edge_followed_by?.count ?? user.follower_count ?? null
+    const following = user.edge_follow?.count ?? user.following_count ?? null
+    const postsCount = user.edge_owner_to_timeline_media?.count ?? user.media_count ?? null
+    const bio = user.biography ?? null
 
-    const recentPosts: SocialPost[] = []
+    // Extract posts with engagement data
+    const posts: SocialPost[] = []
     const edges = user.edge_owner_to_timeline_media?.edges ?? []
 
     for (const edge of edges.slice(0, postsLimit)) {
       const node = edge.node
       if (!node) continue
 
-      recentPosts.push({
+      const captionEdges = node.edge_media_to_caption?.edges ?? []
+      const caption = captionEdges[0]?.node?.text ?? ''
+
+      posts.push({
         url: `https://www.instagram.com/p/${node.shortcode}/`,
-        caption_snippet: (node.edge_media_to_caption?.edges?.[0]?.node?.text ?? '').slice(0, 300),
-        likes: node.edge_liked_by?.count ?? node.edge_media_preview_like?.count ?? null,
-        comments: node.edge_media_to_comment?.count ?? null,
+        caption_snippet: caption.slice(0, 300),
+        likes: node.edge_liked_by?.count ?? node.edge_media_preview_like?.count ?? node.like_count ?? null,
+        comments: node.edge_media_to_comment?.count ?? node.comment_count ?? null,
         posted_at: node.taken_at_timestamp
           ? new Date(node.taken_at_timestamp * 1000).toISOString().split('T')[0]
           : null,
@@ -138,81 +123,100 @@ async function tryPrivateApi(
       })
     }
 
-    log.info(`    IG API: ${followers} followers, ${recentPosts.length} posts with engagement`)
-    return { followers, following, posts_count: postsCount, bio, recent_posts: recentPosts, error: null }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: message }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Strategy 2: Web page via got-scraping (browser TLS fingerprint)
-// ---------------------------------------------------------------------------
-
-async function tryWebPage(
-  handle: string,
-  postsLimit: number,
-  proxyUrl: string | null,
-): Promise<ProfileResult | null> {
-  try {
-    const url = `https://www.instagram.com/${handle}/`
-
-    const response = await gotScraping({
-      url,
-      proxyUrl: proxyUrl ?? undefined,
-      timeout: { request: 30_000 },
-      followRedirect: true,
-      headerGeneratorOptions: {
-        browsers: [{ name: 'chrome', minVersion: 120 }],
-        operatingSystems: ['windows'],
-        locales: ['en-US'],
-      },
-    })
-
-    if (response.statusCode !== 200) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `Web HTTP ${response.statusCode}` }
-    }
-
-    const html = response.body
-    log.info(`    IG web: ${response.statusCode}, HTML ${html.length} chars`)
-
-    // Debug: check what kind of page we got
-    const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
-    const title = titleMatch ? titleMatch[1].trim() : '(no title)'
-    const hasMetaTags = html.includes('og:description')
-    const hasShortcodes = html.includes('"shortcode"')
-    const hasEdgeMedia = html.includes('edge_owner_to_timeline_media')
-    const isLoginPage = html.includes('/accounts/login') || html.includes('loginForm')
-    log.info(`    IG web: title="${title}" meta=${hasMetaTags} shortcodes=${hasShortcodes} edgeMedia=${hasEdgeMedia} login=${isLoginPage}`)
-
-    const posts = extractPostsFromHtml(html, postsLimit)
-    if (posts.length > 0) {
-      log.info(`    IG HTML: extracted ${posts.length} posts with engagement`)
-    }
-
-    const profile = extractProfileFromMetaTags(html)
-    const jsonProfile = extractProfileFromJson(html)
-
     return {
-      followers: jsonProfile.followers ?? profile.followers,
-      following: jsonProfile.following ?? profile.following,
-      posts_count: jsonProfile.postsCount ?? profile.postsCount,
-      bio: jsonProfile.bio ?? profile.bio,
+      followers,
+      following,
+      posts_count: postsCount,
+      bio: bio?.slice(0, 300) ?? null,
       recent_posts: posts,
       error: null,
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `Web: ${message}` }
+    log.warning(`    IG API error: ${message}`)
+    return null
   }
 }
 
 // ---------------------------------------------------------------------------
-// Extract posts from embedded JSON in HTML
+// Strategy 2: Web HTML (embedded JSON extraction)
 // ---------------------------------------------------------------------------
 
-function extractPostsFromHtml(html: string, limit: number): SocialPost[] {
+async function tryWebHtml(
+  handle: string,
+  postsLimit: number,
+  proxyUrl: string | null,
+): Promise<ProfileResult | null> {
+  try {
+    const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
+
+    const url = `https://www.instagram.com/${handle}/`
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30_000)
+
+    const resp = await impit.fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9,pl;q=0.8',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+        'upgrade-insecure-requests': '1',
+      },
+    })
+    clearTimeout(timeout)
+
+    if (resp.status !== 200) {
+      log.info(`    IG web: HTTP ${resp.status}`)
+      return null
+    }
+
+    const html = await resp.text()
+
+    // Debug: what kind of page did we get?
+    const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
+    const title = titleMatch ? titleMatch[1].trim() : '(no title)'
+    const hasMetaTags = html.includes('og:description')
+    const hasShortcodes = html.includes('"shortcode"')
+    const hasEdgeMedia = html.includes('edge_owner_to_timeline_media')
+    log.info(`    IG web: ${html.length} chars, title="${title}" meta=${hasMetaTags} shortcodes=${hasShortcodes} edgeMedia=${hasEdgeMedia}`)
+
+    // Extract profile from meta tags (most reliable when SSR content is present)
+    const metaProfile = extractProfileFromMetaTags(html)
+    let { followers, following, postsCount, bio } = metaProfile
+
+    // Try embedded JSON (more accurate when available)
+    const jsonProfile = extractProfileFromJson(html)
+    followers = jsonProfile.followers ?? followers
+    following = jsonProfile.following ?? following
+    postsCount = jsonProfile.postsCount ?? postsCount
+    bio = jsonProfile.bio ?? bio
+
+    // Extract posts from embedded JSON
+    const posts = extractPostsFromJson(html, postsLimit)
+
+    return {
+      followers,
+      following,
+      posts_count: postsCount,
+      bio,
+      recent_posts: posts,
+      error: posts.length === 0 && followers === null ? 'Could not extract data from profile page' : null,
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    log.warning(`    IG web error: ${message}`)
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Extract posts from embedded JSON in page HTML
+// ---------------------------------------------------------------------------
+
+function extractPostsFromJson(html: string, limit: number): SocialPost[] {
   const posts: SocialPost[] = []
   const seen = new Set<string>()
 
@@ -252,7 +256,7 @@ function extractPostsFromHtml(html: string, limit: number): SocialPost[] {
 }
 
 // ---------------------------------------------------------------------------
-// Extract profile from meta tags / embedded JSON
+// Profile extraction from meta tags / embedded JSON
 // ---------------------------------------------------------------------------
 
 function extractProfileFromMetaTags(html: string): {
@@ -268,7 +272,7 @@ function extractProfileFromMetaTags(html: string): {
   const followersMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Followers|obserwuj[aą]cych|follower)/i)
   const followingMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Following|obserwowanych)/i)
   const postsMatch = decoded.match(/([\d,.]+[KkMm]?)\s*(?:Posts|post[oó]w|post)\b/i)
-  const bioMatch = decoded.match(/[-–—]\s*(.+)$/)
+  const bioMatch = decoded.match(/[-\u2013\u2014]\s*(.+)$/)
 
   return {
     followers: followersMatch ? parseCount(followersMatch[1]) : null,
@@ -291,78 +295,6 @@ function extractProfileFromJson(html: string): {
     following: follow ? parseInt(follow[1], 10) : null,
     postsCount: mediaCount ? parseInt(mediaCount[1], 10) : null,
     bio: bio ? decodeJsonEscapes(bio).slice(0, 300) : null,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Session cookies via got-scraping
-// ---------------------------------------------------------------------------
-
-async function getSessionCookies(pageUrl: string, proxyUrl: string | null): Promise<string | null> {
-  try {
-    const response = await gotScraping({
-      url: pageUrl,
-      proxyUrl: proxyUrl ?? undefined,
-      timeout: { request: 15_000 },
-      followRedirect: true,
-      headerGeneratorOptions: {
-        browsers: [{ name: 'chrome', minVersion: 120 }],
-        operatingSystems: ['windows'],
-        locales: ['en-US'],
-      },
-    })
-
-    // got-scraping returns headers as lowercased keys
-    const setCookieHeaders = response.headers['set-cookie']
-    if (!setCookieHeaders) return null
-
-    const cookieArray = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders]
-    const cookies = cookieArray.map(c => c.split(';')[0]).join('; ')
-    return cookies || null
-  } catch (err) {
-    log.warning(`Failed to get session cookies: ${err}`)
-    return null
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Fresh proxy URL for retry
-// ---------------------------------------------------------------------------
-
-async function getFreshProxyUrl(currentProxyUrl: string): Promise<string | null> {
-  try {
-    const proxyConfig = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] })
-    return (await proxyConfig?.newUrl(`retry_${Date.now()}`)) ?? currentProxyUrl
-  } catch {
-    return currentProxyUrl
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-interface InstagramApiResponse {
-  data?: {
-    user?: {
-      biography?: string
-      edge_followed_by?: { count: number }
-      edge_follow?: { count: number }
-      edge_owner_to_timeline_media?: {
-        count: number
-        edges: {
-          node: {
-            shortcode: string
-            taken_at_timestamp?: number
-            is_video?: boolean
-            edge_media_to_caption?: { edges: { node: { text: string } }[] }
-            edge_liked_by?: { count: number }
-            edge_media_preview_like?: { count: number }
-            edge_media_to_comment?: { count: number }
-          }
-        }[]
-      }
-    }
   }
 }
 
@@ -418,12 +350,4 @@ function parseCount(text: string): number | null {
   if (multiplier === 'M') num *= 1_000_000
 
   return Math.round(num)
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function randomBetween(min: number, max: number): number {
-  return Math.floor(Math.random() * (max - min + 1)) + min
 }

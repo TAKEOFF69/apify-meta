@@ -2,7 +2,7 @@
   "name": "@twenty50/apify-social-scraper",
   "version": "3.0.0",
   "type": "module",
-  "description": "Apify actor: scrape competitor IG + FB social profiles (got-scraping for browser TLS)",
+  "description": "Apify actor: scrape competitor IG + FB social profiles (IMPIT for browser TLS impersonation)",
   "scripts": {
     "start": "node build/main.js",
     "build": "tsc",
@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "apify": "^3.2.0",
-    "got-scraping": "^4.0.0"
+    "impit": "^1.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
