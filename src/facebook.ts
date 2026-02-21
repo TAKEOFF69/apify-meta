@@ -86,14 +86,24 @@ function extractFollowers(html: string): number | null {
     ?? html.match(/<meta\s+content="([^"]+)"\s+property="og:description"/i)
   if (ogMatch) {
     const desc = decodeHtmlEntities(ogMatch[1])
+    log.info(`  [FB debug] og:description decoded: "${desc.slice(0, 200)}"`)
 
     // Polish: "92 525 osób lubi to" or "1 234 obserwujących"
-    const plMatch = desc.match(/([\d\s,.]+)\s*(?:os[oó]b lubi|obserwuj[aą]cych|polubie[nń])/i)
-    if (plMatch) return parseCount(plMatch[1])
+    // Use \d[\d\s.,]* to require at least one digit then optional digit/space/punct
+    const plMatch = desc.match(/(\d[\d\s.,]*)\s*(?:os[oó]b lubi|obserwuj[aą]cych|polubie[nń])/i)
+    if (plMatch) {
+      log.info(`  [FB debug] PL follower match: "${plMatch[1]}" → ${parseCount(plMatch[1])}`)
+      return parseCount(plMatch[1])
+    }
 
     // English: "1,234 people like this" or "1,234 followers"
-    const enMatch = desc.match(/([\d\s,.]+)\s*(?:people like|followers|likes)/i)
-    if (enMatch) return parseCount(enMatch[1])
+    const enMatch = desc.match(/(\d[\d\s.,]*)\s*(?:people like|followers|likes)/i)
+    if (enMatch) {
+      log.info(`  [FB debug] EN follower match: "${enMatch[1]}" → ${parseCount(enMatch[1])}`)
+      return parseCount(enMatch[1])
+    }
+
+    log.info(`  [FB debug] No follower pattern matched in og:description`)
   }
 
   // Strategy 2: Look for follower count in page meta
@@ -199,6 +209,8 @@ function decodeHtmlEntities(text: string): string {
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
     .replace(/&nbsp;/g, ' ')
+    // Normalize non-breaking spaces (U+00A0) and other whitespace to regular spaces
+    .replace(/[\u00A0\u2009\u202F]/g, ' ')
 }
 
 function parseCount(text: string): number | null {

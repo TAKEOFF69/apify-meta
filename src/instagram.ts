@@ -181,10 +181,12 @@ async function tryWebPageFallback(
   try {
     const url = `https://www.instagram.com/${handle}/`
 
+    // Use English locale — IG meta description has follower counts in English format
+    // Polish locale returns "zobacz zdjęcia..." without numbers
     const headers: Record<string, string> = {
       'User-Agent': randomUserAgent(),
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Language': 'en-US,en;q=0.9',
       'Accept-Encoding': 'gzip, deflate, br',
       'Sec-Fetch-Dest': 'document',
       'Sec-Fetch-Mode': 'navigate',
@@ -288,6 +290,7 @@ function decodeHtmlEntities(text: string): string {
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
     .replace(/&nbsp;/g, ' ')
+    .replace(/[\u00A0\u2009\u202F]/g, ' ')
 }
 
 function parseCount(text: string): number | null {
