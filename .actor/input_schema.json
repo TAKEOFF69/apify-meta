@@ -6,12 +6,14 @@
     "customer_slug": {
       "title": "Customer slug",
       "type": "string",
-      "description": "Customer identifier (e.g., 'vcentrum')"
+      "description": "Customer identifier (e.g., 'vcentrum')",
+      "editor": "textfield"
     },
     "competitors": {
       "title": "Competitors",
       "type": "array",
       "description": "List of competitors with social handles",
+      "editor": "json",
       "items": {
         "type": "object",
         "properties": {
@@ -26,7 +28,8 @@
       "title": "Posts per profile",
       "type": "integer",
       "default": 12,
-      "description": "Number of recent posts to scrape per profile"
+      "description": "Number of recent posts to scrape per profile",
+      "editor": "number"
     }
   },
   "required": ["customer_slug", "competitors"]
