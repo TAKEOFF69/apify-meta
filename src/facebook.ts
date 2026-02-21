@@ -1,38 +1,37 @@
 import { log } from 'apify'
-import { Impit } from 'impit'
+import type { BrowserContext } from 'playwright'
 import type { CompetitorSocialResult, SocialPost } from './types.js'
 
 type ProfileResult = Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'platform' | 'scraped_at'>
 
 /**
- * Scrape a Facebook public page using IMPIT (Rust TLS impersonation).
+ * Scrape a Facebook public page using Playwright.
  *
- * Strategy:
- * 1. Visit desktop FB page to bootstrap session (get cookies: datr, fr, etc.)
- * 2. Extract from desktop HTML (embedded JSON: posts, reactions, comments)
- * 3. Use session cookies to visit mbasic (no login redirect with cookies)
- * 4. Extract from mbasic HTML (simpler post structure)
+ * Strategy cascade:
+ * 1. Desktop www.facebook.com — JS renders, extract from embedded JSON
+ * 2. mbasic.facebook.com — simpler HTML fallback (same browser context = has cookies)
  *
- * Session bootstrapping is required because FB redirects to login without cookies.
+ * Optimizations:
+ * - Datacenter proxy (set in main.ts context) — FB tolerates it, $0.25/GB vs $10/GB
+ * - Resource blocking applied at context level (images, CSS, fonts)
+ * - Wait for specific selectors (#4)
  */
 export async function scrapeFacebook(
+  context: BrowserContext,
   pageHandle: string,
   postsLimit: number,
-  proxyUrl: string | null,
 ): Promise<ProfileResult> {
-  const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
-
-  // Strategy 1: Desktop page — get cookies + try extracting rich JSON
-  const { cookies, result: desktopResult } = await tryDesktopPage(impit, pageHandle, postsLimit)
+  // Strategy 1: Desktop page — JS renders, rich embedded JSON
+  const desktopResult = await tryDesktopPage(context, pageHandle, postsLimit)
 
   if (desktopResult && desktopResult.recent_posts.length >= 2) {
     log.info(`    FB desktop: ${desktopResult.recent_posts.length} posts, ${desktopResult.followers ?? '?'} followers`)
     return desktopResult
   }
 
-  // Strategy 2: mbasic with session cookies (should prevent login redirect)
-  log.info(`    FB desktop gave ${desktopResult?.recent_posts.length ?? 0} posts, trying mbasic with cookies`)
-  const mbasicResult = await tryMbasicPage(impit, pageHandle, postsLimit, cookies)
+  // Strategy 2: mbasic — simpler HTML (same context = cookies from desktop visit)
+  log.info(`    FB desktop gave ${desktopResult?.recent_posts.length ?? 0} posts, trying mbasic`)
+  const mbasicResult = await tryMbasicPage(context, pageHandle, postsLimit)
 
   if (mbasicResult && mbasicResult.recent_posts.length > 0) {
     return {
@@ -52,127 +51,99 @@ export async function scrapeFacebook(
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 1: Desktop page via IMPIT (also captures cookies)
+// Strategy 1: Desktop page (Playwright renders JS)
 // ---------------------------------------------------------------------------
 
 async function tryDesktopPage(
-  impit: Impit,
+  context: BrowserContext,
   pageHandle: string,
   postsLimit: number,
-): Promise<{ cookies: string; result: ProfileResult | null }> {
+): Promise<ProfileResult | null> {
+  const page = await context.newPage()
+
   try {
     const url = `https://www.facebook.com/${pageHandle}/`
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
 
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 30_000)
-
-    const resp = await impit.fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-        'cache-control': 'max-age=0',
-        'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
-        'upgrade-insecure-requests': '1',
-      },
+    // Optimization #4: Wait for FB page content to render
+    await page.waitForSelector(
+      '[role="main"], [data-pagelet="PageProfileContent"], [aria-label="Posts"]',
+      { timeout: 15_000 },
+    ).catch(() => {
+      log.info('    FB: page content not found after 15s, continuing')
     })
-    clearTimeout(timeout)
 
-    // Extract cookies for use in subsequent requests
-    const cookies = extractCookies(resp.headers)
-    log.info(`    FB cookies: ${cookies ? cookies.split(';').map(c => c.trim().split('=')[0]).join(', ') : 'none'}`)
+    // Scroll down to load more posts
+    await page.evaluate(() => window.scrollBy(0, 2000))
+    await page.waitForTimeout(2000)
 
-    if (resp.status !== 200) {
-      return { cookies, result: { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${resp.status}` } }
-    }
+    const html = await page.content()
+    log.info(`    FB desktop: ${html.length} chars`)
 
-    const html = await resp.text()
-    log.info(`    FB desktop: ${resp.status}, HTML ${html.length} chars`)
-
-    // Debug
-    const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
-    const title = titleMatch ? titleMatch[1].trim() : '(no title)'
+    const title = await page.title()
     const hasOg = html.includes('og:description')
     const hasCreationTime = (html.match(/"creation_time"/g) || []).length
     const hasMessage = (html.match(/"message"\s*:\s*\{/g) || []).length
     const hasReactionCount = (html.match(/"reaction_count"/g) || []).length
-    const hasFollowerCount = html.includes('follower_count') || html.includes('fan_count')
     const isLoginPage = html.includes('login_form') || html.includes('/login/?next')
-    log.info(`    FB desktop: title="${title}" og=${hasOg} creation_time=${hasCreationTime} messages=${hasMessage} reactions=${hasReactionCount} followerJson=${hasFollowerCount} login=${isLoginPage}`)
+    log.info(`    FB: title="${title}" og=${hasOg} creation_time=${hasCreationTime} messages=${hasMessage} reactions=${hasReactionCount} login=${isLoginPage}`)
 
     const posts = extractPostsFromDesktopJson(html, postsLimit)
     const followers = extractFollowers(html)
     const bio = extractBio(html)
 
+    await page.close()
+
     return {
-      cookies,
-      result: {
-        followers,
-        following: null,
-        posts_count: null,
-        bio,
-        recent_posts: posts,
-        error: null,
-      },
+      followers,
+      following: null,
+      posts_count: null,
+      bio,
+      recent_posts: posts,
+      error: null,
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    return { cookies: '', result: { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: message } }
+    await page.close().catch(() => {})
+    return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: message }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 2: mbasic page with session cookies
+// Strategy 2: mbasic page (simpler HTML, same context has cookies)
 // ---------------------------------------------------------------------------
 
 async function tryMbasicPage(
-  impit: Impit,
+  context: BrowserContext,
   pageHandle: string,
   postsLimit: number,
-  cookies: string,
 ): Promise<ProfileResult | null> {
+  const page = await context.newPage()
+
   try {
     const url = `https://mbasic.facebook.com/${pageHandle}/`
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
 
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 30_000)
-
-    const headers: Record<string, string> = {
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-      'sec-fetch-dest': 'document',
-      'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'same-origin',
-      'upgrade-insecure-requests': '1',
+    // Check if we got redirected to login
+    const currentUrl = page.url()
+    if (currentUrl.includes('/login')) {
+      log.info('    FB mbasic: redirected to login')
+      await page.close()
+      return null
     }
 
-    // Pass session cookies from desktop visit
-    if (cookies) {
-      headers['cookie'] = cookies
-    }
+    await page.waitForTimeout(1000)
 
-    const resp = await impit.fetch(url, { signal: controller.signal, headers })
-    clearTimeout(timeout)
-
-    if (resp.status !== 200) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `mbasic HTTP ${resp.status}` }
-    }
-
-    const html = await resp.text()
-    log.info(`    FB mbasic: ${resp.status}, HTML ${html.length} chars`)
+    const html = await page.content()
+    log.info(`    FB mbasic: ${html.length} chars`)
     const hasStoryLinks = (html.match(/story\.php/g) || []).length
     const hasDataFt = (html.match(/data-ft/g) || []).length
-    const isLoginPage = html.includes('login_form') || html.includes('/login/')
-    log.info(`    FB mbasic: storyLinks=${hasStoryLinks} dataFt=${hasDataFt} login=${isLoginPage}`)
+    log.info(`    FB mbasic: storyLinks=${hasStoryLinks} dataFt=${hasDataFt}`)
 
     const posts = extractPostsFromMbasic(html, postsLimit)
     const followers = extractMbasicFollowers(html)
+
+    await page.close()
 
     return {
       followers,
@@ -184,80 +155,20 @@ async function tryMbasicPage(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
+    await page.close().catch(() => {})
     return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `mbasic: ${message}` }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Extract cookies from response headers
-// ---------------------------------------------------------------------------
-
-function extractCookies(headers: any): string {
-  const cookies: string[] = []
-
-  // Try getSetCookie() (standard Headers API)
-  if (typeof headers?.getSetCookie === 'function') {
-    const setCookies = headers.getSetCookie()
-    for (const cookie of setCookies) {
-      const nameValue = cookie.split(';')[0]
-      if (nameValue && nameValue.includes('=')) cookies.push(nameValue)
-    }
-  }
-
-  // Try get('set-cookie')
-  if (cookies.length === 0 && typeof headers?.get === 'function') {
-    const raw = headers.get('set-cookie')
-    if (raw) {
-      for (const part of raw.split(/,(?=\s*\w+=)/)) {
-        const nameValue = part.split(';')[0].trim()
-        if (nameValue && nameValue.includes('=')) cookies.push(nameValue)
-      }
-    }
-  }
-
-  // Try iterating entries
-  if (cookies.length === 0 && typeof headers?.entries === 'function') {
-    for (const [key, value] of headers.entries()) {
-      if (key.toLowerCase() === 'set-cookie') {
-        const nameValue = value.split(';')[0]
-        if (nameValue && nameValue.includes('=')) cookies.push(nameValue)
-      }
-    }
-  }
-
-  // Try raw() method
-  if (cookies.length === 0 && typeof headers?.raw === 'function') {
-    const raw = headers.raw()
-    const setCookie = raw['set-cookie'] ?? raw['Set-Cookie'] ?? []
-    for (const c of setCookie) {
-      const nameValue = c.split(';')[0]
-      if (nameValue) cookies.push(nameValue)
-    }
-  }
-
-  // Debug if no cookies found
-  if (cookies.length === 0) {
-    const keys: string[] = []
-    if (typeof headers?.forEach === 'function') {
-      headers.forEach((_v: string, k: string) => keys.push(k))
-    } else if (typeof headers?.entries === 'function') {
-      for (const [k] of headers.entries()) keys.push(k)
-    }
-    log.info(`    Cookie extraction: 0 cookies. Header keys: ${keys.join(', ') || 'none'}`)
-    log.info(`    Headers type: ${typeof headers}, constructor: ${headers?.constructor?.name}`)
-  }
-
-  return cookies.join('; ')
-}
-
-// ---------------------------------------------------------------------------
-// Extract posts from desktop HTML embedded JSON
+// Extract posts from desktop embedded JSON
 // ---------------------------------------------------------------------------
 
 function extractPostsFromDesktopJson(html: string, limit: number): SocialPost[] {
   const posts: SocialPost[] = []
   const seen = new Set<string>()
 
+  // Method A: creation_time anchors
   const creationTimePattern = /"creation_time"\s*:\s*(\d{10})/g
   let match: RegExpExecArray | null
 
@@ -304,7 +215,7 @@ function extractPostsFromDesktopJson(html: string, limit: number): SocialPost[] 
     })
   }
 
-  // Method B: Find "message":{"text":"..."} if method A found few posts
+  // Method B: message text anchors
   if (posts.length < limit) {
     const messagePattern = /"message"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g
     while ((match = messagePattern.exec(html)) !== null && posts.length < limit) {
@@ -398,7 +309,6 @@ function extractPostsFromMbasic(html: string, limit: number): SocialPost[] {
     })
   }
 
-  // Alternative: data-ft structures
   if (posts.length === 0) {
     const articlePattern = /<div[^>]*data-ft[^>]*>([\s\S]*?)<\/div>\s*<div[^>]*>\s*<a[^>]*href="\/story/g
     while ((match = articlePattern.exec(html)) !== null && posts.length < limit) {
@@ -412,10 +322,7 @@ function extractPostsFromMbasic(html: string, limit: number): SocialPost[] {
       posts.push({
         url: '',
         caption_snippet: decodeHtmlEntities(content).slice(0, 300),
-        likes: null,
-        comments: null,
-        posted_at: null,
-        media_type: null,
+        likes: null, comments: null, posted_at: null, media_type: null,
       })
     }
   }
@@ -424,7 +331,7 @@ function extractPostsFromMbasic(html: string, limit: number): SocialPost[] {
 }
 
 // ---------------------------------------------------------------------------
-// Extract followers
+// Follower / bio extraction
 // ---------------------------------------------------------------------------
 
 function extractMbasicFollowers(html: string): number | null {

@@ -6,8 +6,8 @@
   "buildTag": "latest",
   "dockerfile": "./Dockerfile",
   "dockerContextDir": "..",
-  "defaultMemoryMbytes": 128,
-  "minMemoryMbytes": 128,
-  "maxMemoryMbytes": 256,
+  "defaultMemoryMbytes": 1024,
+  "minMemoryMbytes": 512,
+  "maxMemoryMbytes": 4096,
   "input": "./input_schema.json"
 }

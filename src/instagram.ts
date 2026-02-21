@@ -1,306 +1,82 @@
 import { log } from 'apify'
-import { Impit } from 'impit'
+import type { BrowserContext } from 'playwright'
 import type { CompetitorSocialResult, SocialPost } from './types.js'
 
 type ProfileResult = Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'platform' | 'scraped_at'>
 
-const IG_APP_ID = '936619743392459'
-
 /**
- * Scrape an Instagram public profile using IMPIT (Rust TLS impersonation).
+ * Scrape an Instagram public profile using Playwright.
  *
- * Strategy:
- * 1. Visit the IG web page to bootstrap a session (get cookies: csrftoken, mid, ig_did)
- * 2. Use those cookies to call the REST API for structured profile + post data
- * 3. If API fails, fall back to extracting from the web page HTML
- *
- * Session bootstrapping is required because Meta returns 404 from the API
- * and JS-only shells from the web page without proper session cookies.
+ * Optimizations:
+ * - Browser context reused (created once in main.ts, resource blocking applied)
+ * - Wait for specific selectors, not arbitrary timeouts (#4)
+ * - Extract from rendered page: embedded JSON has profile + posts with engagement
  */
 export async function scrapeInstagram(
+  context: BrowserContext,
   handle: string,
   postsLimit: number,
-  proxyUrl: string | null,
 ): Promise<ProfileResult> {
   const cleanHandle = handle.replace(/^@/, '')
-  const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
+  const page = await context.newPage()
 
-  // Step 1: Bootstrap session by visiting the profile page
-  const { cookies, html } = await bootstrapSession(impit, cleanHandle)
-  log.info(`    IG session: ${cookies.length} cookies captured`)
-
-  // Step 2: Try REST API with session cookies
-  if (cookies.length > 0) {
-    const apiResult = await tryRestApi(impit, cleanHandle, postsLimit, cookies)
-    if (apiResult && apiResult.recent_posts.length > 0) {
-      log.info(`    IG API: ${apiResult.followers ?? '?'} followers, ${apiResult.recent_posts.length} posts`)
-      return apiResult
-    }
-    log.info(`    IG API gave ${apiResult?.recent_posts.length ?? 0} posts, trying HTML extraction`)
-  }
-
-  // Step 3: Extract from the web page HTML we already have
-  if (html) {
-    const webResult = extractFromHtml(html, postsLimit)
-    if (webResult.recent_posts.length > 0 || webResult.followers !== null) {
-      log.info(`    IG web: ${webResult.followers ?? '?'} followers, ${webResult.recent_posts.length} posts`)
-      return webResult
-    }
-  }
-
-  return {
-    followers: null, following: null, posts_count: null, bio: null,
-    recent_posts: [], error: 'All Instagram strategies failed',
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Session bootstrapping — visit web page to capture cookies
-// ---------------------------------------------------------------------------
-
-async function bootstrapSession(
-  impit: Impit,
-  handle: string,
-): Promise<{ cookies: string; html: string | null }> {
   try {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 30_000)
+    const url = `https://www.instagram.com/${cleanHandle}/`
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
 
-    const resp = await impit.fetch(`https://www.instagram.com/${handle}/`, {
-      signal: controller.signal,
-      headers: {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'accept-language': 'en-US,en;q=0.9',
-        'cache-control': 'max-age=0',
-        'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
-        'upgrade-insecure-requests': '1',
-      },
+    // Optimization #4: Wait for specific content selectors, not arbitrary timeout
+    await page.waitForSelector(
+      'meta[property="og:description"], header section, article, [data-testid="user-avatar"]',
+      { timeout: 15_000 },
+    ).catch(() => {
+      log.info('    IG: profile elements not found after 15s, continuing with available data')
     })
-    clearTimeout(timeout)
 
-    // Extract cookies from response headers
-    const cookies = extractCookies(resp.headers)
-    log.info(`    IG bootstrap: HTTP ${resp.status}, cookies: ${cookies ? cookies.split(';').map(c => c.trim().split('=')[0]).join(', ') : 'none'}`)
+    // Small extra wait for dynamic JSON injection
+    await page.waitForTimeout(2000)
 
-    let html: string | null = null
-    if (resp.status === 200) {
-      html = await resp.text()
-      const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
-      const title = titleMatch ? titleMatch[1].trim() : '(no title)'
-      const hasMetaTags = html.includes('og:description')
-      const hasShortcodes = html.includes('"shortcode"')
-      log.info(`    IG bootstrap: ${html.length} chars, title="${title}" meta=${hasMetaTags} shortcodes=${hasShortcodes}`)
-    }
+    const html = await page.content()
+    log.info(`    IG page: ${html.length} chars`)
 
-    return { cookies, html }
-  } catch (err) {
-    log.warning(`    IG bootstrap error: ${err instanceof Error ? err.message : String(err)}`)
-    return { cookies: '', html: null }
-  }
-}
+    // Debug: page content analysis
+    const title = await page.title()
+    const hasMetaTags = html.includes('og:description')
+    const hasShortcodes = html.includes('"shortcode"')
+    const hasEdgeMedia = html.includes('edge_owner_to_timeline_media')
+    log.info(`    IG: title="${title}" meta=${hasMetaTags} shortcodes=${hasShortcodes} edgeMedia=${hasEdgeMedia}`)
 
-// ---------------------------------------------------------------------------
-// Extract cookies from response headers
-// ---------------------------------------------------------------------------
+    // --- Extract profile metrics ---
+    const metaProfile = extractProfileFromMetaTags(html)
+    const jsonProfile = extractProfileFromJson(html)
 
-function extractCookies(headers: any): string {
-  const cookies: string[] = []
+    const followers = jsonProfile.followers ?? metaProfile.followers
+    const following = jsonProfile.following ?? metaProfile.following
+    const postsCount = jsonProfile.postsCount ?? metaProfile.postsCount
+    const bio = jsonProfile.bio ?? metaProfile.bio
 
-  // Try getSetCookie() (standard Headers API)
-  if (typeof headers?.getSetCookie === 'function') {
-    const setCookies = headers.getSetCookie()
-    for (const cookie of setCookies) {
-      const nameValue = cookie.split(';')[0]
-      if (nameValue) cookies.push(nameValue)
-    }
-  }
+    // --- Extract posts ---
+    const posts = extractPostsFromJson(html, postsLimit)
 
-  // Try get('set-cookie') — may return comma-joined or single
-  if (cookies.length === 0 && typeof headers?.get === 'function') {
-    const raw = headers.get('set-cookie')
-    if (raw) {
-      // set-cookie headers may be comma-separated
-      for (const part of raw.split(/,(?=\s*\w+=)/)) {
-        const nameValue = part.split(';')[0].trim()
-        if (nameValue && nameValue.includes('=')) cookies.push(nameValue)
-      }
-    }
-  }
-
-  // Try iterating entries
-  if (cookies.length === 0 && typeof headers?.entries === 'function') {
-    for (const [key, value] of headers.entries()) {
-      if (key.toLowerCase() === 'set-cookie') {
-        const nameValue = value.split(';')[0]
-        if (nameValue) cookies.push(nameValue)
-      }
-    }
-  }
-
-  // Try raw() method (Node.js undici)
-  if (cookies.length === 0 && typeof headers?.raw === 'function') {
-    const raw = headers.raw()
-    const setCookie = raw['set-cookie'] ?? raw['Set-Cookie'] ?? []
-    for (const c of setCookie) {
-      const nameValue = c.split(';')[0]
-      if (nameValue) cookies.push(nameValue)
-    }
-  }
-
-  // Debug: log header keys available
-  if (cookies.length === 0) {
-    const keys: string[] = []
-    if (typeof headers?.forEach === 'function') {
-      headers.forEach((_v: string, k: string) => keys.push(k))
-    } else if (typeof headers?.entries === 'function') {
-      for (const [k] of headers.entries()) keys.push(k)
-    }
-    log.info(`    Cookie extraction: 0 cookies. Header keys: ${keys.join(', ') || 'none'}`)
-    log.info(`    Headers type: ${typeof headers}, constructor: ${headers?.constructor?.name}`)
-    if (typeof headers?.get === 'function') {
-      log.info(`    set-cookie header: ${headers.get('set-cookie')?.slice(0, 200) ?? 'null'}`)
-    }
-  }
-
-  return cookies.join('; ')
-}
-
-// ---------------------------------------------------------------------------
-// REST API with session cookies
-// ---------------------------------------------------------------------------
-
-async function tryRestApi(
-  impit: Impit,
-  handle: string,
-  postsLimit: number,
-  cookies: string,
-): Promise<ProfileResult | null> {
-  try {
-    const csrfMatch = cookies.match(/csrftoken=([^;]+)/)
-    const csrfToken = csrfMatch?.[1] ?? ''
-
-    const url = `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(handle)}`
-
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 30_000)
-
-    const resp = await impit.fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'cookie': cookies,
-        'x-csrftoken': csrfToken,
-        'x-ig-app-id': IG_APP_ID,
-        'x-ig-www-claim': '0',
-        'x-requested-with': 'XMLHttpRequest',
-        'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9',
-        'referer': `https://www.instagram.com/${handle}/`,
-        'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-site',
-      },
-    })
-    clearTimeout(timeout)
-
-    log.info(`    IG API: HTTP ${resp.status}`)
-
-    if (resp.status === 429) {
-      log.warning('    IG API: Rate limited (429)')
-      return null
-    }
-
-    if (resp.status !== 200) {
-      const body = await resp.text().catch(() => '')
-      log.info(`    IG API: Non-200 (${resp.status}), body preview: ${body.slice(0, 200)}`)
-      return null
-    }
-
-    const json = await resp.json() as any
-    const user = json?.data?.user ?? json?.user
-    if (!user) {
-      log.info('    IG API: No user object in response')
-      return null
-    }
-
-    const followers = user.edge_followed_by?.count ?? user.follower_count ?? null
-    const following = user.edge_follow?.count ?? user.following_count ?? null
-    const postsCount = user.edge_owner_to_timeline_media?.count ?? user.media_count ?? null
-    const bio = user.biography ?? null
-
-    // Extract posts with engagement data
-    const posts: SocialPost[] = []
-    const edges = user.edge_owner_to_timeline_media?.edges ?? []
-
-    for (const edge of edges.slice(0, postsLimit)) {
-      const node = edge.node
-      if (!node) continue
-
-      const captionEdges = node.edge_media_to_caption?.edges ?? []
-      const caption = captionEdges[0]?.node?.text ?? ''
-
-      posts.push({
-        url: `https://www.instagram.com/p/${node.shortcode}/`,
-        caption_snippet: caption.slice(0, 300),
-        likes: node.edge_liked_by?.count ?? node.edge_media_preview_like?.count ?? node.like_count ?? null,
-        comments: node.edge_media_to_comment?.count ?? node.comment_count ?? null,
-        posted_at: node.taken_at_timestamp
-          ? new Date(node.taken_at_timestamp * 1000).toISOString().split('T')[0]
-          : null,
-        media_type: node.is_video ? 'video' : 'image',
-      })
-    }
+    log.info(`    IG: ${followers ?? '?'} followers, ${posts.length} posts extracted`)
+    await page.close()
 
     return {
       followers,
       following,
       posts_count: postsCount,
-      bio: bio?.slice(0, 300) ?? null,
+      bio,
       recent_posts: posts,
-      error: null,
+      error: posts.length === 0 && followers === null ? 'Could not extract data from profile page' : null,
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    log.warning(`    IG API error: ${message}`)
-    return null
+    await page.close().catch(() => {})
+    return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: message }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Extract from web page HTML (already fetched during bootstrap)
-// ---------------------------------------------------------------------------
-
-function extractFromHtml(html: string, postsLimit: number): ProfileResult {
-  const metaProfile = extractProfileFromMetaTags(html)
-  const jsonProfile = extractProfileFromJson(html)
-
-  const followers = jsonProfile.followers ?? metaProfile.followers
-  const following = jsonProfile.following ?? metaProfile.following
-  const postsCount = jsonProfile.postsCount ?? metaProfile.postsCount
-  const bio = jsonProfile.bio ?? metaProfile.bio
-
-  const posts = extractPostsFromJson(html, postsLimit)
-
-  return {
-    followers,
-    following,
-    posts_count: postsCount,
-    bio,
-    recent_posts: posts,
-    error: posts.length === 0 && followers === null ? 'Could not extract data from profile page' : null,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Extract posts from embedded JSON
+// Extract posts from embedded JSON in rendered page
 // ---------------------------------------------------------------------------
 
 function extractPostsFromJson(html: string, limit: number): SocialPost[] {
@@ -343,7 +119,7 @@ function extractPostsFromJson(html: string, limit: number): SocialPost[] {
 }
 
 // ---------------------------------------------------------------------------
-// Profile extraction from meta tags / embedded JSON
+// Profile extraction
 // ---------------------------------------------------------------------------
 
 function extractProfileFromMetaTags(html: string): {
