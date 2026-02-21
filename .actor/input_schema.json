@@ -13,16 +13,7 @@
       "title": "Competitors",
       "type": "array",
       "description": "List of competitors with social handles",
-      "editor": "json",
-      "items": {
-        "type": "object",
-        "properties": {
-          "name": { "type": "string" },
-          "instagram": { "type": "string" },
-          "facebook": { "type": "string" }
-        },
-        "required": ["name"]
-      }
+      "editor": "json"
     },
     "posts_per_profile": {
       "title": "Posts per profile",
