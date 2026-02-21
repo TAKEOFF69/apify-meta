@@ -218,7 +218,21 @@ function parseCount(text: string): number | null {
   const match = cleaned.match(/([\d,.]+)\s*([KkMm])?/)
   if (!match) return null
 
-  let num = parseFloat(match[1].replace(',', '.'))
+  let numStr = match[1]
+
+  // Detect thousand separator vs decimal:
+  // "7,970" → comma + 3 digits = thousand separator → remove commas
+  // "1.234" → dot + 3 digits = thousand separator (European) → remove dots
+  // "1.5" or "1,5" → decimal separator
+  if (/,\d{3}/.test(numStr)) {
+    numStr = numStr.replace(/,/g, '')
+  } else if (/\.\d{3}/.test(numStr)) {
+    numStr = numStr.replace(/\./g, '')
+  } else {
+    numStr = numStr.replace(',', '.')
+  }
+
+  let num = parseFloat(numStr)
   if (isNaN(num)) return null
 
   const mult = match[2]?.toUpperCase()
