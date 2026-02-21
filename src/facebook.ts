@@ -7,29 +7,32 @@ type ProfileResult = Omit<CompetitorSocialResult, 'customer_slug' | 'name' | 'pl
 /**
  * Scrape a Facebook public page using IMPIT (Rust TLS impersonation).
  *
- * Strategy cascade:
- * 1. Desktop HTML (www.facebook.com) — embedded JSON: posts, reactions, comments
- * 2. Mobile HTML (mbasic.facebook.com) — simpler HTML, fallback for post text
+ * Strategy:
+ * 1. Visit desktop FB page to bootstrap session (get cookies: datr, fr, etc.)
+ * 2. Extract from desktop HTML (embedded JSON: posts, reactions, comments)
+ * 3. Use session cookies to visit mbasic (no login redirect with cookies)
+ * 4. Extract from mbasic HTML (simpler post structure)
  *
- * IMPIT impersonates Chrome's exact TLS fingerprint, so Meta serves
- * SSR content instead of JS-only shells.
+ * Session bootstrapping is required because FB redirects to login without cookies.
  */
 export async function scrapeFacebook(
   pageHandle: string,
   postsLimit: number,
   proxyUrl: string | null,
 ): Promise<ProfileResult> {
-  // Strategy 1: Desktop page — rich JSON embedded in HTML
-  const desktopResult = await tryDesktopPage(pageHandle, postsLimit, proxyUrl)
+  const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
+
+  // Strategy 1: Desktop page — get cookies + try extracting rich JSON
+  const { cookies, result: desktopResult } = await tryDesktopPage(impit, pageHandle, postsLimit)
 
   if (desktopResult && desktopResult.recent_posts.length >= 2) {
     log.info(`    FB desktop: ${desktopResult.recent_posts.length} posts, ${desktopResult.followers ?? '?'} followers`)
     return desktopResult
   }
 
-  // Strategy 2: mbasic — simpler HTML
-  log.info(`    FB desktop gave ${desktopResult?.recent_posts.length ?? 0} posts, trying mbasic`)
-  const mbasicResult = await tryMbasicPage(pageHandle, postsLimit, proxyUrl)
+  // Strategy 2: mbasic with session cookies (should prevent login redirect)
+  log.info(`    FB desktop gave ${desktopResult?.recent_posts.length ?? 0} posts, trying mbasic with cookies`)
+  const mbasicResult = await tryMbasicPage(impit, pageHandle, postsLimit, cookies)
 
   if (mbasicResult && mbasicResult.recent_posts.length > 0) {
     return {
@@ -49,16 +52,15 @@ export async function scrapeFacebook(
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 1: Desktop page via IMPIT
+// Strategy 1: Desktop page via IMPIT (also captures cookies)
 // ---------------------------------------------------------------------------
 
 async function tryDesktopPage(
+  impit: Impit,
   pageHandle: string,
   postsLimit: number,
-  proxyUrl: string | null,
-): Promise<ProfileResult | null> {
+): Promise<{ cookies: string; result: ProfileResult | null }> {
   try {
-    const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
     const url = `https://www.facebook.com/${pageHandle}/`
 
     const controller = new AbortController()
@@ -67,8 +69,12 @@ async function tryDesktopPage(
     const resp = await impit.fetch(url, {
       signal: controller.signal,
       headers: {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+        'cache-control': 'max-age=0',
+        'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
         'sec-fetch-dest': 'document',
         'sec-fetch-mode': 'navigate',
         'sec-fetch-site': 'none',
@@ -78,14 +84,18 @@ async function tryDesktopPage(
     })
     clearTimeout(timeout)
 
+    // Extract cookies for use in subsequent requests
+    const cookies = extractCookies(resp.headers)
+    log.info(`    FB cookies: ${cookies ? cookies.split(';').map(c => c.trim().split('=')[0]).join(', ') : 'none'}`)
+
     if (resp.status !== 200) {
-      return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${resp.status}` }
+      return { cookies, result: { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: `HTTP ${resp.status}` } }
     }
 
     const html = await resp.text()
     log.info(`    FB desktop: ${resp.status}, HTML ${html.length} chars`)
 
-    // Debug: what patterns exist
+    // Debug
     const titleMatch = html.match(/<title[^>]*>([^<]{0,200})<\/title>/i)
     const title = titleMatch ? titleMatch[1].trim() : '(no title)'
     const hasOg = html.includes('og:description')
@@ -101,46 +111,53 @@ async function tryDesktopPage(
     const bio = extractBio(html)
 
     return {
-      followers,
-      following: null,
-      posts_count: null,
-      bio,
-      recent_posts: posts,
-      error: null,
+      cookies,
+      result: {
+        followers,
+        following: null,
+        posts_count: null,
+        bio,
+        recent_posts: posts,
+        error: null,
+      },
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    return { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: message }
+    return { cookies: '', result: { followers: null, following: null, posts_count: null, bio: null, recent_posts: [], error: message } }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Strategy 2: mbasic page via IMPIT
+// Strategy 2: mbasic page with session cookies
 // ---------------------------------------------------------------------------
 
 async function tryMbasicPage(
+  impit: Impit,
   pageHandle: string,
   postsLimit: number,
-  proxyUrl: string | null,
+  cookies: string,
 ): Promise<ProfileResult | null> {
   try {
-    const impit = new Impit({ browser: 'chrome', proxyUrl: proxyUrl ?? undefined })
     const url = `https://mbasic.facebook.com/${pageHandle}/`
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 30_000)
 
-    const resp = await impit.fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'upgrade-insecure-requests': '1',
-      },
-    })
+    const headers: Record<string, string> = {
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'same-origin',
+      'upgrade-insecure-requests': '1',
+    }
+
+    // Pass session cookies from desktop visit
+    if (cookies) {
+      headers['cookie'] = cookies
+    }
+
+    const resp = await impit.fetch(url, { signal: controller.signal, headers })
     clearTimeout(timeout)
 
     if (resp.status !== 200) {
@@ -172,6 +189,68 @@ async function tryMbasicPage(
 }
 
 // ---------------------------------------------------------------------------
+// Extract cookies from response headers
+// ---------------------------------------------------------------------------
+
+function extractCookies(headers: any): string {
+  const cookies: string[] = []
+
+  // Try getSetCookie() (standard Headers API)
+  if (typeof headers?.getSetCookie === 'function') {
+    const setCookies = headers.getSetCookie()
+    for (const cookie of setCookies) {
+      const nameValue = cookie.split(';')[0]
+      if (nameValue && nameValue.includes('=')) cookies.push(nameValue)
+    }
+  }
+
+  // Try get('set-cookie')
+  if (cookies.length === 0 && typeof headers?.get === 'function') {
+    const raw = headers.get('set-cookie')
+    if (raw) {
+      for (const part of raw.split(/,(?=\s*\w+=)/)) {
+        const nameValue = part.split(';')[0].trim()
+        if (nameValue && nameValue.includes('=')) cookies.push(nameValue)
+      }
+    }
+  }
+
+  // Try iterating entries
+  if (cookies.length === 0 && typeof headers?.entries === 'function') {
+    for (const [key, value] of headers.entries()) {
+      if (key.toLowerCase() === 'set-cookie') {
+        const nameValue = value.split(';')[0]
+        if (nameValue && nameValue.includes('=')) cookies.push(nameValue)
+      }
+    }
+  }
+
+  // Try raw() method
+  if (cookies.length === 0 && typeof headers?.raw === 'function') {
+    const raw = headers.raw()
+    const setCookie = raw['set-cookie'] ?? raw['Set-Cookie'] ?? []
+    for (const c of setCookie) {
+      const nameValue = c.split(';')[0]
+      if (nameValue) cookies.push(nameValue)
+    }
+  }
+
+  // Debug if no cookies found
+  if (cookies.length === 0) {
+    const keys: string[] = []
+    if (typeof headers?.forEach === 'function') {
+      headers.forEach((_v: string, k: string) => keys.push(k))
+    } else if (typeof headers?.entries === 'function') {
+      for (const [k] of headers.entries()) keys.push(k)
+    }
+    log.info(`    Cookie extraction: 0 cookies. Header keys: ${keys.join(', ') || 'none'}`)
+    log.info(`    Headers type: ${typeof headers}, constructor: ${headers?.constructor?.name}`)
+  }
+
+  return cookies.join('; ')
+}
+
+// ---------------------------------------------------------------------------
 // Extract posts from desktop HTML embedded JSON
 // ---------------------------------------------------------------------------
 
@@ -179,7 +258,6 @@ function extractPostsFromDesktopJson(html: string, limit: number): SocialPost[] 
   const posts: SocialPost[] = []
   const seen = new Set<string>()
 
-  // Method A: Find "creation_time" anchors and extract nearby post data
   const creationTimePattern = /"creation_time"\s*:\s*(\d{10})/g
   let match: RegExpExecArray | null
 
@@ -208,7 +286,6 @@ function extractPostsFromDesktopJson(html: string, limit: number): SocialPost[] 
       ?? vicinity.match(/"i18n_reaction_count"\s*:\s*"(\d+)/)
     const commentCount = vicinity.match(/"comment_count"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)/)
       ?? vicinity.match(/"total_comment_count"\s*:\s*(\d+)/)
-    const shareCount = vicinity.match(/"share_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)/)
 
     const postUrl = vicinity.match(/"url"\s*:\s*"(https?:\\\/\\\/www\.facebook\.com\\\/[^"]+permalink[^"]+)"/)?.[1]
       ?? vicinity.match(/"url"\s*:\s*"(https?:\\\/\\\/www\.facebook\.com\\\/(?:photo|video|reel)[^"]+)"/)?.[1]
