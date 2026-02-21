@@ -85,6 +85,20 @@ async function tryDesktopPage(
     }
 
     const html = await response.text()
+    log.info(`    FB desktop: ${response.status}, HTML ${html.length} chars`)
+
+    // Debug: what patterns exist in the HTML
+    const hasOg = html.includes('og:description')
+    const hasCreationTime = (html.match(/"creation_time"/g) || []).length
+    const hasMessage = (html.match(/"message"\s*:\s*\{/g) || []).length
+    const hasReactionCount = (html.match(/"reaction_count"/g) || []).length
+    const hasFollowerCount = html.includes('follower_count') || html.includes('fan_count')
+    log.info(`    FB desktop: og=${hasOg} creation_time=${hasCreationTime} messages=${hasMessage} reactions=${hasReactionCount} followerJson=${hasFollowerCount}`)
+
+    // Check if we got a login redirect
+    if (html.includes('login_form') || html.includes('/login/')) {
+      log.warning('    FB desktop: got login page instead of public page')
+    }
 
     // Extract posts from embedded JSON (primary goal)
     const posts = extractPostsFromDesktopJson(html, postsLimit)
@@ -135,6 +149,14 @@ async function tryMbasicPage(
     }
 
     const html = await response.text()
+    log.info(`    FB mbasic: ${response.status}, HTML ${html.length} chars`)
+    const hasStoryLinks = (html.match(/story\.php/g) || []).length
+    const hasDataFt = (html.match(/data-ft/g) || []).length
+    log.info(`    FB mbasic: storyLinks=${hasStoryLinks} dataFt=${hasDataFt}`)
+    if (html.includes('login_form') || html.includes('/login/')) {
+      log.warning('    FB mbasic: got login page')
+    }
+
     const posts = extractPostsFromMbasic(html, postsLimit)
     const followers = extractMbasicFollowers(html)
 

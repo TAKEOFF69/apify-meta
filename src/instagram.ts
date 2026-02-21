@@ -177,6 +177,13 @@ async function tryWebPage(
     }
 
     const html = await response.text()
+    log.info(`    IG web: ${response.status}, HTML ${html.length} chars`)
+
+    // Quick debug: check what we got
+    const hasMetaTags = html.includes('og:description')
+    const hasShortcodes = html.includes('"shortcode"')
+    const hasEdgeMedia = html.includes('edge_owner_to_timeline_media')
+    log.info(`    IG web: meta=${hasMetaTags} shortcodes=${hasShortcodes} edgeMedia=${hasEdgeMedia}`)
 
     // --- Extract posts from embedded JSON in HTML ---
     const posts = extractPostsFromHtml(html, postsLimit)
