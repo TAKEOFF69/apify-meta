@@ -5,7 +5,7 @@
   "version": "1.0",
   "buildTag": "latest",
   "dockerfile": "./Dockerfile",
-  "dockerContextDir": ".",
+  "dockerContextDir": "..",
   "defaultMemoryMbytes": 512,
   "minMemoryMbytes": 256,
   "maxMemoryMbytes": 1024,
