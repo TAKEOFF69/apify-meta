@@ -36,7 +36,7 @@ log.info(`Starting social scrape for ${input.customer_slug}: ${input.competitors
 // Launch browser with Apify proxy
 // Try residential first (best for IG), fall back to datacenter proxies
 let proxyConfiguration: Awaited<ReturnType<typeof Actor.createProxyConfiguration>> | null = null
-for (const group of ['RESIDENTIAL', 'BUYPROXIES94952', 'StaticUS3']) {
+for (const group of ['BUYPROXIES94952', 'RESIDENTIAL', 'StaticUS3']) {
   try {
     proxyConfiguration = await Actor.createProxyConfiguration({ groups: [group] })
     const testUrl = await proxyConfiguration!.newUrl()
